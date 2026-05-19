@@ -116,3 +116,4 @@ prepared statement - подготовленный оператор
 Global Deadlock Detector - процесс обнаружения взаимных блокировок (Global Deadlock Detector)
 readable table - читающая таблица
 writable table - пишущая таблица
+leaf partition - конечная партиция
