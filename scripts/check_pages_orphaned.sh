@@ -17,9 +17,9 @@ check_lang() {
     # SQL command / utility reference lists), so the xrefs to check against
     # live partly in those partials, not just in nav.adoc itself.
     local nav_text
-    nav_text=$(cat "$nav")
+    nav_text=$(grep -vE '^[[:space:]]*//' "$nav")
     while IFS= read -r partial_name; do
-        nav_text+=$'\n'"$(cat "$root/partials/$partial_name" 2>/dev/null)"
+        nav_text+=$'\n'"$(grep -vE '^[[:space:]]*//' "$root/partials/$partial_name" 2>/dev/null)"
     done < <(grep -oE 'include::partial\$[^[]+\.adoc' "$nav" | sed -E 's#include::partial\$##')
 
     while IFS= read -r -d '' file; do
