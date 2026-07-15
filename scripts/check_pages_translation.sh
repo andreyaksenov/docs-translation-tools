@@ -13,13 +13,20 @@ strict=0
 # on macOS's default bash 3.2 / BSD regex engine).
 STOPWORDS_RE='[[:<:]](the|is|are|and|or|with|this|that|these|those|you|your|for|from|into|when|where|which|while|because|however|therefore|then|than|been|have|has|had|will|would|should|could|can|not|but|also|each|such|only|about|between|through|before|after|during|without|within|both|either|neither|more|most|some|any|all|other|same|its|their|our)[[:>:]]'
 
-is_code_delim() {
-    # Only literal/listing block delimiters carry code; ====, ****, |===
-    # are prose containers (example, sidebar, table) and must not toggle
-    # the same flag or nesting (e.g. a ---- block inside ====) breaks it.
-    # Trailing whitespace is tolerated: asciidoc/adoc renderers accept it,
-    # and a strict match would desync the toggle for the rest of the file.
-    [[ "$1" =~ ^(----|\.\.\.\.)[[:space:]]*$ ]]
+# Proper nouns that never get translated; a line consisting only of one of
+# these plus a version number/punctuation (e.g. "- CentOS 7.9.") is not
+# untranslated prose and shouldn't be flagged.
+PRODUCT_NAMES_RE='CentOS|Ubuntu|Red Hat|RHEL'
+
+# Which literal/listing block, if any, we're currently inside: "" (none),
+# "dash" (----) or "dot" (....). ====, ****, |=== are prose containers
+# (example, sidebar, table) and don't toggle this.
+code_delim_type() {
+    if [[ "$1" =~ ^----[[:space:]]*$ ]]; then
+        echo dash
+    elif [[ "$1" =~ ^\.\.\.\.[[:space:]]*$ ]]; then
+        echo dot
+    fi
 }
 
 is_skip_line() {
@@ -42,7 +49,7 @@ is_skip_line() {
     # once you discount the inline code and placeholder names, e.g.
     # "* `id` -- `INT`;" or "CONNECTION LIMIT <connlimit> +".
     local stripped
-    stripped=$(sed -E -e 's/`[^`]*`//g' -e 's/<[^>]*>//g' <<< "$line")
+    stripped=$(sed -E -e 's/`[^`]*`//g' -e 's/<[^>]*>//g' -e "s/[[:<:]](${PRODUCT_NAMES_RE})[[:>:]]//g" <<< "$line")
     [[ "$stripped" =~ [a-z] ]] || return 0
 
     return 1
@@ -89,18 +96,27 @@ check_pair() {
     local n=${#en_lines[@]}
     (( ${#ru_lines[@]} < n )) && n=${#ru_lines[@]}
 
-    local in_code=0 in_cell=0 header_printed=0 i lineno en_line ru_line wc
+    local in_code="" in_cell=0 header_printed=0 i lineno en_line ru_line wc delim
 
     for (( i = 0; i < n; i++ )); do
         en_line="${en_lines[$i]}"
         ru_line="${ru_lines[$i]}"
         lineno=$(( i + 1 ))
 
-        if is_code_delim "$en_line"; then
-            in_code=$(( 1 - in_code ))
+        delim=$(code_delim_type "$en_line")
+        if [[ -n "$delim" ]]; then
+            # Only a delimiter matching the currently open block type closes
+            # it; a mismatched one (e.g. a literal "----" table border
+            # inside a .... block) is just content and must not desync the
+            # toggle.
+            if [[ "$in_code" == "$delim" ]]; then
+                in_code=""
+            elif [[ -z "$in_code" ]]; then
+                in_code="$delim"
+            fi
             continue
         fi
-        (( in_code )) && continue
+        [[ -n "$in_code" ]] && continue
 
         # An `a|` cell holds multiple asciidoc paragraphs (blank-line
         # separated); only the first carries the marker, so track it
