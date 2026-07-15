@@ -6,7 +6,8 @@ EN_ROOT="en/modules/ROOT"
 status=0
 
 while IFS= read -r -d '' file; do
-    hits=$(grep -nP '[\x{0400}-\x{04FF}]' "$file" 2>/dev/null) || continue
+    hits=$(perl -CSD -ne 'print "$.:$_" if /[\x{0400}-\x{04FF}]/' "$file" 2>/dev/null)
+    [[ -n "$hits" ]] || continue
     printf 'FILE     %s\n' "$file"
     printf '%s\n' "$hits" | sed -E 's/^([0-9]+):/  line \1: /'
     status=1
