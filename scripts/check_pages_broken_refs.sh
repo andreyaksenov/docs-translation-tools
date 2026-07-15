@@ -8,6 +8,31 @@ report() {
     status=1
 }
 
+# A page's anchors aren't necessarily in the page's own source: pages like
+# guc_reference.adoc are assembled entirely from include::partial$...[]
+# partials, so anchor lookup has to follow those includes (recursively, with
+# a depth cap as a guard against any accidental include cycle).
+collect_include_partials() {
+    local file="$1" root="$2" depth="${3:-0}"
+    (( depth > 5 )) && return
+    echo "$file"
+    local partial_name
+    while IFS= read -r partial_name; do
+        local partial_file="$root/partials/$partial_name"
+        [[ -f "$partial_file" ]] && collect_include_partials "$partial_file" "$root" "$(( depth + 1 ))"
+    done < <(grep -oE 'include::partial\$[^[]+\.adoc' "$file" 2>/dev/null | sed -E 's#include::partial\$##')
+}
+
+# Anchors are declared as their own line, either "[#id]" or "[[id]]" /
+# "[[id,xreflabel]]".
+anchor_exists() {
+    local target_file="$1" id="$2" root="$3" f
+    while IFS= read -r f; do
+        grep -qE '^\[#'"$id"'\]$|^\[\['"$id"'(,|\]\])' "$f" 2>/dev/null && return 0
+    done < <(collect_include_partials "$target_file" "$root")
+    return 1
+}
+
 # Lines to ignore when scanning for references: asciidoc comments, and
 # anything inside a ---- / .... literal/listing block (illustrative syntax
 # shown as an example, not live markup).
@@ -44,9 +69,24 @@ check_file() {
                 # product-releases:ROOT:x) means a different, external component,
                 # which isn't resolvable here.
                 [[ "$target" =~ ^[A-Za-z][A-Za-z0-9_-]*: ]] && continue
-                target="${target%%#*}"
-                [[ "$target" == *.adoc ]] || continue  # same-page anchor, not a file reference
-                [[ -f "$root/pages/$target" ]] || report "$file" "$lineno" "xref:$target"
+
+                local fragment=""
+                if [[ "$target" == *#* ]]; then
+                    fragment="${target#*#}"
+                    target="${target%%#*}"
+                fi
+
+                if [[ "$target" == *.adoc ]]; then
+                    local target_file="$root/pages/$target"
+                    if [[ ! -f "$target_file" ]]; then
+                        report "$file" "$lineno" "xref:$target"
+                    elif [[ -n "$fragment" ]] && ! anchor_exists "$target_file" "$fragment" "$root"; then
+                        report "$file" "$lineno" "xref:$target#$fragment (anchor not found)"
+                    fi
+                elif [[ -n "$target" ]]; then
+                    # No .adoc suffix: a same-page anchor reference.
+                    anchor_exists "$file" "$target" "$root" || report "$file" "$lineno" "xref:$target (anchor not found)"
+                fi
                 ;;
             include::partial\$*)
                 target="${target#include::partial\$}"
