@@ -118,3 +118,14 @@ Deeper check for `pages/`/`partials/` `.adoc` files: compares the structural "sk
 Checks `pages/` and `partials/` `.adoc` files for lines that look like they were never translated: walks EN and RU line-by-line (skipping code blocks, attributes, comments, table cells, and code/keyword-only lines like headings or `term::` definitions) and flags any prose line where RU is byte-identical to EN.
 
 This is a heuristic, not a full AsciiDoc parser — treat findings as a review list, not a hard failure.
+
+### Sync a RU page after an EN edit
+
+```bash
+./scripts/sync_pages_from_en.py en/modules/ROOT/pages/reference/utils/analyzedb.adoc
+./scripts/sync_pages_from_en.py <path/to/en/file.adoc> -n   # dry run: print the diff instead of writing
+```
+
+Only ever writes the RU counterpart; never touches EN. Aligns RU's structure (headings, anchors, delimited blocks, option/flag terms, code lines) to EN's, and copies in new or changed EN lines verbatim (left untranslated) wherever RU has nothing corresponding yet — run `check_pages_translation.sh` afterward to find them. Existing RU prose is never rewritten or removed; only technical tokens that must be byte-identical across languages (flag names, code/command lines, include paths, ids) are corrected when they've drifted (e.g. a stale `plpythonu` left behind after EN moved to `plpython3u`).
+
+This is a heuristic aligner, not a semantic merge: when an EN paragraph is reworded (not just extended), the new wording is appended after the existing translation rather than replacing it — review and reconcile those cases by hand.
