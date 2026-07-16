@@ -206,10 +206,40 @@ def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, 
             continue
         en_type, ru_type = en_sig_slice[ei][0], ru_sig_slice[ri][0]
         if en_type != ru_type:
-            # Genuine mismatch: a new EN sentence landing next to unrelated
-            # RU content that has nothing left to pair against. Decouple
-            # them -- keep RU's line as-is and insert EN's as new -- rather
-            # than zipping positionally and silently discarding one side.
+            # A mismatch here means the nested type-level diff found no
+            # anchor to bracket this remainder on (generic types are
+            # deliberately incomparable across sides, to avoid misplacing
+            # sentences) -- but if the *tail* of the longer remainder has
+            # the same type shape as the whole shorter remainder, that's a
+            # strong sign the real edit was "new content prepended" (or old
+            # content removed from the front), not "everything from here on
+            # is unrelated". Peel off just the non-matching prefix as new/
+            # orphaned and resume normal pairing from where the shapes line
+            # up again -- otherwise a block prepended in EN (e.g. a new
+            # admonition) gets torn apart and interleaved one line at a time
+            # with the unrelated RU sentences it now sits in front of.
+            en_rest_types = [t[0] for t in en_sig_slice[ei:]]
+            ru_rest_types = [t[0] for t in ru_sig_slice[ri:]]
+            if len(en_rest_types) > len(ru_rest_types) and en_rest_types[-len(ru_rest_types):] == ru_rest_types:
+                prefix_len = len(en_rest_types) - len(ru_rest_types)
+                extra = en_slice[ei:ei + prefix_len]
+                out.extend(extra)
+                inserted.append(extra)
+                ei += prefix_len
+                continue
+            if len(ru_rest_types) > len(en_rest_types) and ru_rest_types[-len(en_rest_types):] == en_rest_types:
+                prefix_len = len(ru_rest_types) - len(en_rest_types)
+                extra = ru_slice[ri:ri + prefix_len]
+                out.extend(extra)
+                non_marker = [l for l, s in zip(extra, ru_sig_slice[ri:ri + prefix_len]) if s[0] != "STALEMARK"]
+                if non_marker:
+                    orphaned.append(non_marker)
+                ri += prefix_len
+                continue
+            # No clean suffix alignment either -- genuinely unrelated content
+            # on both sides for the rest of this span. Decouple them -- keep
+            # RU's line as-is and insert EN's as new -- rather than zipping
+            # positionally and silently discarding one side.
             out.append(ru_slice[ri])
             orphaned.append([ru_slice[ri]])
             out.append(en_slice[ei])
