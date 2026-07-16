@@ -292,6 +292,17 @@ def find_reworded_lines(en_path: Path, ru_path: Path, en_lines, ru_lines, pairs,
     if not ref:
         return None, []
 
+    # A RU line that was itself touched since `ref` -- e.g. hand-translated
+    # in the working tree but not committed yet -- has already been dealt
+    # with, even though it (correctly) still reads nothing like the EN text.
+    # Without this, every real translation would immediately get re-flagged
+    # as "stale" purely for not being byte-identical to EN.
+    ru_touched = set()
+    for h in _git_diff_hunks(ref, ru_path):
+        if h["new_count"] == 0:
+            continue
+        ru_touched.update(range(h["new_start"], h["new_start"] + h["new_count"]))
+
     hunks = _git_diff_hunks(ref, en_path)
     en_to_ru = dict(pairs)
     findings = []
@@ -306,6 +317,8 @@ def find_reworded_lines(en_path: Path, ru_path: Path, en_lines, ru_lines, pairs,
             ru_idx = en_to_ru.get(en_idx)
             if ru_idx is None:
                 continue  # new/inserted line, not an existing aligned pair -- already handled elsewhere
+            if (ru_idx + 1) in ru_touched:
+                continue  # RU already edited since ref -- treat as resolved
             old_en = h["minus"][k] if k < len(h["minus"]) else None
             findings.append({
                 "lineno": new_lineno,
