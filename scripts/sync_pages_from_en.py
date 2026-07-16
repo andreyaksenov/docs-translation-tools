@@ -39,6 +39,12 @@ ATTR_RE = re.compile(r'^\[[^\[\]].*]\s*$')
 INCLUDE_RE = re.compile(r'^include::')
 BLOCKTITLE_RE = re.compile(r'^\.[^.\s]')
 TERM_RE = re.compile(r'^(\[\[[\w-]+])?(.+)::\s*$')
+# A list item that's just a bare xref (e.g. a "See also" bullet). The target
+# path is never translated, so align on it like an anchor -- otherwise a
+# newly-inserted bullet is generic "prose" to the aligner, and a naive
+# front-to-back positional pairing against the existing (differently-
+# ordered) bullets can discard the new item and duplicate an old one instead.
+XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
 COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
 CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
 
@@ -88,6 +94,10 @@ def classify(line, stack):
 
     if INCLUDE_RE.match(line):
         return ("INCLUDE", line)
+
+    m = XREF_ITEM_RE.match(line)
+    if m:
+        return ("XREFITEM", m.group(1))
 
     if BLOCKTITLE_RE.match(line):
         return ("BLOCKTITLE",)
