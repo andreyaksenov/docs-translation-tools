@@ -40,6 +40,7 @@ ATTR_RE = re.compile(r'^\[[^\[\]].*]\s*$')
 INCLUDE_RE = re.compile(r'^include::')
 BLOCKTITLE_RE = re.compile(r'^\.[^.\s]')
 TERM_RE = re.compile(r'^(\[\[[\w-]+])?(.+)::\s*$')
+ALL_CAPS_TERM_RE = re.compile(r'^[A-Z][A-Z0-9_]*(\s*,\s*[A-Z][A-Z0-9_]*)*$')
 # A list item that's just a bare xref (e.g. a "See also" bullet). The target
 # path is never translated, so align on it like an anchor -- otherwise a
 # newly-inserted bullet is generic "prose" to the aligner, and a naive
@@ -114,11 +115,18 @@ def classify(line, stack):
 
     m = TERM_RE.match(line)
     if m:
-        content = m.group(2)
-        # Only flag-like ('-x', '--long-flag') or code-span (`name`) terms are
-        # untranslatable; a plain word/phrase term (e.g. a [tabs] tab label
-        # like "Day name::") is ordinary translated content, not a literal.
-        if content.lstrip().startswith(("-", "`")):
+        content = m.group(2).strip()
+        # Flag-like ('-x', '--long-flag'), code-span (`name`), and ALL-CAPS
+        # config-file parameter names (PORT_BASE, HBA_HOSTNAMES, possibly a
+        # comma-separated list like "QD_PRIMARY_ARRAY, PRIMARY_ARRAY") are all
+        # untranslatable identifiers and should align like anchors, not
+        # positionally -- otherwise a page full of config-key definitions
+        # (gpinitsystem-style) has no real alignment anchors at all, and a
+        # structural change elsewhere on the page can drift an unrelated,
+        # already-correct key/description pair apart. A plain word/phrase
+        # term (e.g. a [tabs] tab label like "Day name::") is ordinary
+        # translated content, not a literal.
+        if content.startswith(("-", "`")) or ALL_CAPS_TERM_RE.match(content):
             return ("TERM", line)
         return ("TERMX",)
 
@@ -481,12 +489,32 @@ def main():
     if ru_existed and ref is None:
         print(f"\nNOTE: no git history found for {ru_path}; skipped the reworded-line check.")
 
-    # Drop blank lines and stale-version marker comments before judging a
-    # block "real" -- a stray blank surviving a structural shift, or a
-    # marker this same run just inserted, isn't leftover dead content.
+    # Drop blank lines, stale-version marker comments, and lines already
+    # explained by another report section before judging a block "real".
+    # Content sitting right next to a structural change elsewhere on the
+    # page (e.g. a big block removed nearby) can get caught by the same
+    # type-mismatch fallback that flags genuine orphans, even though it was
+    # already correctly resolved (e.g. as part of a reworded-line mark) --
+    # without this, the same line would be reported twice, once correctly
+    # and once as a misleading "review this" false alarm.
+    already_reported = set()
+    for f in reworded:
+        already_reported.add(f["new_en"])
+        already_reported.add(f["ru"])
+        if f["old_en"] is not None:
+            already_reported.add(f["old_en"])
+    for old, new in replaced:
+        already_reported.add(old)
+        already_reported.add(new)
+    for block in inserted:
+        already_reported.update(block)
+
     real_orphaned = []
     for block in orphaned:
-        visible = [l for l in block if l.strip() and not STALE_MARK_RE.match(l.strip())]
+        visible = [
+            l for l in block
+            if l.strip() and not STALE_MARK_RE.match(l.strip()) and l not in already_reported
+        ]
         if visible:
             real_orphaned.append(visible)
     if real_orphaned:
