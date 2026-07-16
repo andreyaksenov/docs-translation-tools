@@ -47,6 +47,18 @@ ALL_CAPS_TERM_RE = re.compile(r'^[A-Z][A-Z0-9_]*(\s*,\s*[A-Z][A-Z0-9_]*)*$')
 # front-to-back positional pairing against the existing (differently-
 # ordered) bullets can discard the new item and duplicate an old one instead.
 XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
+# The first cell of a PSV table row whose content is an untranslated literal
+# identifier (a config/YAML key name, e.g. `|HOST <coordinator_hostname>` or
+# `|VERSION`) -- these are kept byte-identical across EN/RU everywhere in this
+# docs set. Without recognizing them, every such line falls through to plain
+# PROSE like the surrounding translated cells (`a|...` descriptions, `|Yes`/
+# `|Да` markers), and a table of many near-identical (CELL, PROSE, BLANK)
+# row shapes gives the nested type-only diff nothing real to anchor on --
+# once one row's line count drifts, alignment cascades wrong for the rest of
+# the table. Requiring 2+ leading uppercase/digit/underscore chars excludes
+# ordinary capitalized English cells like `|Yes` or `|The database ...`
+# (which have a lowercase letter right after the initial capital).
+CELL_KEY_RE = re.compile(r'^\|[A-Z][A-Z0-9_]+\b')
 COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
 STALE_MARK_RE = re.compile(r'^// STALE VERSION:')
 CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
@@ -54,7 +66,7 @@ CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
 # Signature types whose text is required to be byte-identical between EN and
 # RU (flag names, code, paths, ids). When a 'replace' op pairs an EN/RU line
 # of one of these types and the text differs, RU is overwritten with EN's.
-FORCE_SYNC_TYPES = {"DELIM", "ID", "ATTR", "INCLUDE", "TERM", "CODE", "CONT"}
+FORCE_SYNC_TYPES = {"DELIM", "ID", "ATTR", "INCLUDE", "TERM", "CODE", "CONT", "CELLKEY"}
 
 
 def classify(line, stack):
@@ -112,6 +124,13 @@ def classify(line, stack):
 
     if BLOCKTITLE_RE.match(line):
         return ("BLOCKTITLE",)
+
+    # Guard against a translated RU description cell that merely *starts*
+    # with a Latin acronym kept untranslated (e.g. `|SQL-команда...`,
+    # `|HTTP-запрос...`) -- a genuine literal key cell never contains
+    # Cyrillic, so require the whole line to be Cyrillic-free.
+    if CELL_KEY_RE.match(line) and not CYRILLIC_RE.search(line):
+        return ("CELLKEY", stripped)
 
     m = TERM_RE.match(line)
     if m:
@@ -172,32 +191,46 @@ def _sync_pair(en_l, ru_l, sig_type, replaced, en_idx, force_synced):
 
 
 def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
-    common = min(len(en_slice), len(ru_slice))
-    for k in range(common):
-        en_type, ru_type = en_sig_slice[k][0], ru_sig_slice[k][0]
-        if en_type != ru_type:
-            # This is the leftover-tail case of a 'replace' span whose two
-            # sides don't actually line up (e.g. a genuinely new EN sentence
-            # landing next to an unrelated leftover STALEMARK comment --
-            # SequenceMatcher still has to bucket a same-length remainder as
-            # 'replace' even when the types differ). Zipping them positionally
-            # would silently keep one side and discard the other; instead
-            # decouple them -- keep RU's line as-is and insert EN's as new.
-            out.append(ru_slice[k])
-            orphaned.append([ru_slice[k]])
-            out.append(en_slice[k])
-            inserted.append([en_slice[k]])
+    # Independent EN/RU cursors, not a shared index: a STALEMARK line (from
+    # this same run's own stale-marking pass, or a leftover from an earlier
+    # one) is RU-only *by construction* -- it is never supposed to consume
+    # an EN slot or shift the positional pairing of the real content that
+    # follows it. Treating it like a generic type mismatch (as a shared-index
+    # zip would) misreads the line right after it as "new" and duplicates
+    # it, purely because the marker shifted the RU side by one.
+    ei = ri = 0
+    while ei < len(en_slice) and ri < len(ru_slice):
+        if ru_sig_slice[ri][0] == "STALEMARK":
+            out.append(ru_slice[ri])
+            ri += 1
             continue
-        out.append(_sync_pair(en_slice[k], ru_slice[k], en_type, replaced, en_base + k, force_synced))
-        pairs.append((en_base + k, ru_base + k))
-    if len(en_slice) > common:
-        extra = en_slice[common:]
+        en_type, ru_type = en_sig_slice[ei][0], ru_sig_slice[ri][0]
+        if en_type != ru_type:
+            # Genuine mismatch: a new EN sentence landing next to unrelated
+            # RU content that has nothing left to pair against. Decouple
+            # them -- keep RU's line as-is and insert EN's as new -- rather
+            # than zipping positionally and silently discarding one side.
+            out.append(ru_slice[ri])
+            orphaned.append([ru_slice[ri]])
+            out.append(en_slice[ei])
+            inserted.append([en_slice[ei]])
+            ei += 1
+            ri += 1
+            continue
+        out.append(_sync_pair(en_slice[ei], ru_slice[ri], en_type, replaced, en_base + ei, force_synced))
+        pairs.append((en_base + ei, ru_base + ri))
+        ei += 1
+        ri += 1
+    if ei < len(en_slice):
+        extra = en_slice[ei:]
         out.extend(extra)
         inserted.append(extra)
-    elif len(ru_slice) > common:
-        extra = ru_slice[common:]
+    if ri < len(ru_slice):
+        extra = ru_slice[ri:]
         out.extend(extra)
-        orphaned.append(extra)
+        non_marker = [l for l, s in zip(extra, ru_sig_slice[ri:]) if s[0] != "STALEMARK"]
+        if non_marker:
+            orphaned.append(non_marker)
 
 
 def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
@@ -210,8 +243,17 @@ def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, ins
     # diff) fixes that: same-type runs still pair front-to-back as before,
     # but a type that only exists on one side becomes a clean insert/leave-
     # as-is instead of a bad pairing.
-    en_types = [t[0] for t in en_sig_slice]
-    ru_types = [t[0] for t in ru_sig_slice]
+    # Reuse the same per-side-unique wrapping as the top-level matcher: a
+    # generic type (PROSE, BLOCKTITLE, ...) reduced to its bare type name is
+    # not a trustworthy anchor -- two unrelated PROSE lines both being
+    # "PROSE" does not mean they correspond, and a nested 'equal' opcode
+    # skips _sync_pair's force-sync guard entirely, silently keeping RU's
+    # old text and discarding the new EN line. BLANK is deliberately not a
+    # generic type (a blank line carries no content, so treating any blank
+    # as interchangeable with any other is safe) -- that's what lets a
+    # missing blank line still realign correctly around a real title/anchor.
+    en_types = matching_signatures(en_sig_slice, "EN")
+    ru_types = matching_signatures(ru_sig_slice, "RU")
     sm2 = difflib.SequenceMatcher(a=en_types, b=ru_types, autojunk=False)
 
     for tag, i1, i2, j1, j2 in sm2.get_opcodes():
