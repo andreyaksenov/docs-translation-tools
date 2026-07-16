@@ -47,6 +47,7 @@ TERM_RE = re.compile(r'^(\[\[[\w-]+])?(.+)::\s*$')
 # ordered) bullets can discard the new item and duplicate an old one instead.
 XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
 COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
+STALE_MARK_RE = re.compile(r'^// STALE VERSION:')
 CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
 
 # Signature types whose text is required to be byte-identical between EN and
@@ -57,6 +58,14 @@ FORCE_SYNC_TYPES = {"DELIM", "ID", "ATTR", "INCLUDE", "TERM", "CODE", "CONT"}
 
 def classify(line, stack):
     stripped = line.strip()
+
+    # A stale-marker comment left by a previous sync run. It only ever
+    # exists on the RU side and is expected to have no EN counterpart, so it
+    # must never be mistaken for ordinary PROSE: doing so lets it steal a
+    # pairing slot in the nested type-alignment from a real adjacent line
+    # (misplacing that line) and makes it look "orphaned" in its own report.
+    if STALE_MARK_RE.match(stripped):
+        return ("STALEMARK",)
 
     if DELIM_RE.match(stripped):
         if stack and stack[-1] == stripped:
@@ -154,7 +163,7 @@ def _sync_pair(en_l, ru_l, sig_type, replaced, en_idx, force_synced):
     return ru_l
 
 
-def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced):
+def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
     common = min(len(en_slice), len(ru_slice))
     for k in range(common):
         out.append(_sync_pair(en_slice[k], ru_slice[k], sig_slice[k][0], replaced, en_base + k, force_synced))
@@ -164,10 +173,12 @@ def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replace
         out.extend(extra)
         inserted.append(extra)
     elif len(ru_slice) > common:
-        out.extend(ru_slice[common:])
+        extra = ru_slice[common:]
+        out.extend(extra)
+        orphaned.append(extra)
 
 
-def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced):
+def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
     # A naive positional zip assumes the k-th EN line always corresponds to
     # the k-th RU line, which breaks when the two sides' *kinds* of content
     # don't actually line up here (e.g. RU is missing a blank line that EN
@@ -194,11 +205,13 @@ def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, ins
             out.extend(new_lines)
             inserted.append(new_lines)
         elif tag == "insert":
-            out.extend(ru_slice[j1:j2])
+            extra = ru_slice[j1:j2]
+            out.extend(extra)
+            orphaned.append(extra)
         elif tag == "replace":
             _front_pair_and_append(
                 en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], out, inserted, replaced,
-                pairs, en_base + i1, ru_base + j1, force_synced,
+                pairs, en_base + i1, ru_base + j1, force_synced, orphaned,
                        )
 
 
@@ -214,6 +227,7 @@ def merge(en_lines, ru_lines):
     replaced = []   # list[(old, new)]
     pairs = []      # list[(en_idx, ru_idx)] -- every position where a 1:1 EN<->RU correspondence was established
     force_synced = set()  # en_idx values already auto-corrected via `replaced` -- not also "possibly stale" prose
+    orphaned = []   # list[list[str]] -- RU content structurally left with no EN counterpart at all (never deleted)
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
@@ -226,15 +240,20 @@ def merge(en_lines, ru_lines):
             out.extend(new_lines)
             inserted.append(new_lines)
         elif tag == "insert":
-            # b[j1:j2] (RU) has no counterpart in a (EN): leave RU as-is.
-            out.extend(ru_lines[j1:j2])
+            # b[j1:j2] (RU) has no counterpart in a (EN): leave RU as-is, but
+            # flag it -- this is exactly the shape left behind when EN
+            # deliberately removes a whole section (e.g. a bogus option):
+            # RU's now-orphaned content has nothing left to align against.
+            extra = ru_lines[j1:j2]
+            out.extend(extra)
+            orphaned.append(extra)
         elif tag == "replace":
             _align_replace_span(
                 en_lines[i1:i2], ru_lines[j1:j2], en_sigs[i1:i2], ru_sigs[j1:j2],
-                out, inserted, replaced, pairs, i1, j1, force_synced,
+                out, inserted, replaced, pairs, i1, j1, force_synced, orphaned,
             )
 
-    return out, inserted, replaced, pairs, force_synced
+    return out, inserted, replaced, pairs, force_synced, orphaned
 
 
 HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
@@ -388,7 +407,7 @@ def main():
         print(f"NOTE: {ru_path} does not exist yet -- creating it as a full (untranslated) copy of EN.")
         ru_lines = []
 
-    merged, inserted, replaced, pairs, force_synced = merge(en_lines, ru_lines)
+    merged, inserted, replaced, pairs, force_synced, orphaned = merge(en_lines, ru_lines)
 
     # Structural sync only catches new/missing lines and literal-token drift.
     # An existing sentence that was *reworded* in place (same line count) is
@@ -403,7 +422,7 @@ def main():
                 # Re-run the structural merge over the stale-marked RU lines so the
                 # two kinds of changes (new/missing content, reworded-in-place
                 # content) land together in a single coherent diff/write.
-                merged, inserted, replaced, pairs, force_synced = merge(en_lines, ru_lines_marked)
+                merged, inserted, replaced, pairs, force_synced, orphaned = merge(en_lines, ru_lines_marked)
 
     structurally_synced = merged == ru_lines
 
@@ -447,6 +466,23 @@ def main():
 
     if ru_existed and ref is None:
         print(f"\nNOTE: no git history found for {ru_path}; skipped the reworded-line check.")
+
+    # Drop blank lines and stale-version marker comments before judging a
+    # block "real" -- a stray blank surviving a structural shift, or a
+    # marker this same run just inserted, isn't leftover dead content.
+    real_orphaned = []
+    for block in orphaned:
+        visible = [l for l in block if l.strip() and not STALE_MARK_RE.match(l.strip())]
+        if visible:
+            real_orphaned.append(visible)
+    if real_orphaned:
+        total = sum(len(b) for b in real_orphaned)
+        print(f"\nPOSSIBLY ORPHANED: {total} RU line(s) across {len(real_orphaned)} block(s) have no EN counterpart")
+        print("anywhere nearby (left in place, not deleted -- review whether EN removed this on purpose):")
+        for block in real_orphaned:
+            for l in block:
+                print(f"  ? {l}")
+            print()
 
     if inserted or replaced or marked:
         print("\nNext: run scripts/check_pages_translation.sh to locate the newly untranslated lines for translation.")
