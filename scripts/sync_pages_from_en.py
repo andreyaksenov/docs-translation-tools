@@ -163,10 +163,24 @@ def _sync_pair(en_l, ru_l, sig_type, replaced, en_idx, force_synced):
     return ru_l
 
 
-def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
+def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
     common = min(len(en_slice), len(ru_slice))
     for k in range(common):
-        out.append(_sync_pair(en_slice[k], ru_slice[k], sig_slice[k][0], replaced, en_base + k, force_synced))
+        en_type, ru_type = en_sig_slice[k][0], ru_sig_slice[k][0]
+        if en_type != ru_type:
+            # This is the leftover-tail case of a 'replace' span whose two
+            # sides don't actually line up (e.g. a genuinely new EN sentence
+            # landing next to an unrelated leftover STALEMARK comment --
+            # SequenceMatcher still has to bucket a same-length remainder as
+            # 'replace' even when the types differ). Zipping them positionally
+            # would silently keep one side and discard the other; instead
+            # decouple them -- keep RU's line as-is and insert EN's as new.
+            out.append(ru_slice[k])
+            orphaned.append([ru_slice[k]])
+            out.append(en_slice[k])
+            inserted.append([en_slice[k]])
+            continue
+        out.append(_sync_pair(en_slice[k], ru_slice[k], en_type, replaced, en_base + k, force_synced))
         pairs.append((en_base + k, ru_base + k))
     if len(en_slice) > common:
         extra = en_slice[common:]
@@ -210,9 +224,9 @@ def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, ins
             orphaned.append(extra)
         elif tag == "replace":
             _front_pair_and_append(
-                en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], out, inserted, replaced,
-                pairs, en_base + i1, ru_base + j1, force_synced, orphaned,
-                       )
+                en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], ru_sig_slice[j1:j2],
+                out, inserted, replaced, pairs, en_base + i1, ru_base + j1, force_synced, orphaned,
+                                                )
 
 
 def merge(en_lines, ru_lines):
