@@ -17,6 +17,7 @@ Usage:
 import argparse
 import difflib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -142,20 +143,22 @@ def matching_signatures(sigs, side):
     return out
 
 
-def _sync_pair(en_l, ru_l, sig_type, replaced):
+def _sync_pair(en_l, ru_l, sig_type, replaced, en_idx, force_synced):
     # A Cyrillic RU line is clearly deliberate translated content (a
     # label/comment inside a literal block, say), never stale code left
     # behind from an old EN wording -- never overwrite it.
     if sig_type in FORCE_SYNC_TYPES and en_l != ru_l and not CYRILLIC_RE.search(ru_l):
         replaced.append((ru_l, en_l))
+        force_synced.add(en_idx)
         return en_l
     return ru_l
 
 
-def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replaced):
+def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced):
     common = min(len(en_slice), len(ru_slice))
     for k in range(common):
-        out.append(_sync_pair(en_slice[k], ru_slice[k], sig_slice[k][0], replaced))
+        out.append(_sync_pair(en_slice[k], ru_slice[k], sig_slice[k][0], replaced, en_base + k, force_synced))
+        pairs.append((en_base + k, ru_base + k))
     if len(en_slice) > common:
         extra = en_slice[common:]
         out.extend(extra)
@@ -164,7 +167,7 @@ def _front_pair_and_append(en_slice, ru_slice, sig_slice, out, inserted, replace
         out.extend(ru_slice[common:])
 
 
-def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced):
+def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced):
     # A naive positional zip assumes the k-th EN line always corresponds to
     # the k-th RU line, which breaks when the two sides' *kinds* of content
     # don't actually line up here (e.g. RU is missing a blank line that EN
@@ -181,7 +184,11 @@ def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, ins
     for tag, i1, i2, j1, j2 in sm2.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
-                out.append(_sync_pair(en_slice[i1 + k], ru_slice[j1 + k], en_sig_slice[i1 + k][0], replaced))
+                out.append(_sync_pair(
+                    en_slice[i1 + k], ru_slice[j1 + k], en_sig_slice[i1 + k][0], replaced,
+                    en_base + i1 + k, force_synced,
+                    ))
+                pairs.append((en_base + i1 + k, ru_base + j1 + k))
         elif tag == "delete":
             new_lines = en_slice[i1:i2]
             out.extend(new_lines)
@@ -189,7 +196,10 @@ def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, ins
         elif tag == "insert":
             out.extend(ru_slice[j1:j2])
         elif tag == "replace":
-            _front_pair_and_append(en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], out, inserted, replaced)
+            _front_pair_and_append(
+                en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], out, inserted, replaced,
+                pairs, en_base + i1, ru_base + j1, force_synced,
+                       )
 
 
 def merge(en_lines, ru_lines):
@@ -202,10 +212,14 @@ def merge(en_lines, ru_lines):
     out = []
     inserted = []   # list[list[str]]
     replaced = []   # list[(old, new)]
+    pairs = []      # list[(en_idx, ru_idx)] -- every position where a 1:1 EN<->RU correspondence was established
+    force_synced = set()  # en_idx values already auto-corrected via `replaced` -- not also "possibly stale" prose
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             out.extend(ru_lines[j1:j2])
+            for k in range(i2 - i1):
+                pairs.append((i1 + k, j1 + k))
         elif tag == "delete":
             # a[i1:i2] (EN) has no counterpart in b (RU): new EN content.
             new_lines = en_lines[i1:i2]
@@ -217,10 +231,112 @@ def merge(en_lines, ru_lines):
         elif tag == "replace":
             _align_replace_span(
                 en_lines[i1:i2], ru_lines[j1:j2], en_sigs[i1:i2], ru_sigs[j1:j2],
-                out, inserted, replaced,
+                out, inserted, replaced, pairs, i1, j1, force_synced,
             )
 
-    return out, inserted, replaced
+    return out, inserted, replaced, pairs, force_synced
+
+
+HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+
+
+def _last_commit_touching(path: Path):
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", str(path)],
+        capture_output=True, text=True,
+    )
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def _git_diff_hunks(ref: str, path: Path):
+    # -U0: zero context lines, so each hunk's line ranges map exactly to the
+    # lines actually touched by the edit -- no unrelated context to filter out.
+    result = subprocess.run(
+        ["git", "diff", "--unified=0", ref, "--", str(path)],
+        capture_output=True, text=True,
+    )
+    hunks = []
+    current = None
+    for line in result.stdout.splitlines():
+        m = HUNK_RE.match(line)
+        if m:
+            if current:
+                hunks.append(current)
+            old_start, old_count, new_start, new_count = m.groups()
+            current = {
+                "old_count": int(old_count) if old_count is not None else 1,
+                "new_start": int(new_start),
+                "new_count": int(new_count) if new_count is not None else 1,
+                "minus": [], "plus": [],
+            }
+        elif current is not None and line.startswith("-") and not line.startswith("---"):
+            current["minus"].append(line[1:])
+        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+            current["plus"].append(line[1:])
+    if current:
+        hunks.append(current)
+    return hunks
+
+
+def find_reworded_lines(en_path: Path, ru_path: Path, en_lines, ru_lines, pairs, force_synced, since: str = None):
+    """Find EN lines that were *modified* (not purely added) since `since`
+    (default: the last commit that touched the RU file), and map them to
+    their currently-aligned RU line. This catches the case the structural
+    merge cannot: an existing sentence reworded in place, where the line
+    count doesn't change so the aligner treats it as an unchanged 'equal'
+    pair and RU -- though still fully translated-looking text -- silently
+    goes stale. Never edits anything; for review only.
+    """
+    ref = since or _last_commit_touching(ru_path)
+    if not ref:
+        return None, []
+
+    hunks = _git_diff_hunks(ref, en_path)
+    en_to_ru = dict(pairs)
+    findings = []
+    for h in hunks:
+        if h["old_count"] == 0 or h["new_count"] == 0:
+            continue  # pure addition or pure deletion, not a reword
+        for k in range(h["new_count"]):
+            new_lineno = h["new_start"] + k
+            en_idx = new_lineno - 1
+            if en_idx in force_synced:
+                continue  # already auto-corrected (a literal/code token drift), not a translation gap
+            ru_idx = en_to_ru.get(en_idx)
+            if ru_idx is None:
+                continue  # new/inserted line, not an existing aligned pair -- already handled elsewhere
+            old_en = h["minus"][k] if k < len(h["minus"]) else None
+            findings.append({
+                "lineno": new_lineno,
+                "old_en": old_en,
+                "new_en": en_lines[en_idx],
+                "ru_lineno": ru_idx + 1,
+                "ru": ru_lines[ru_idx],
+            })
+    return ref, findings
+
+
+def apply_stale_markers(ru_lines, reworded):
+    """Replace each reworded RU line with the new EN sentence (left
+    untranslated, same as any other new content), preserving the old RU
+    wording as a comment on its own line right after -- AsciiDoc only
+    treats '//' as a comment when it's the first thing on the line, so it
+    can't be appended inline after real paragraph text.
+    """
+    marked = list(ru_lines)
+    count = 0
+    # Descending order so inserting a comment line doesn't shift the
+    # position of findings at smaller indices not yet applied.
+    for f in sorted(reworded, key=lambda f: f["ru_lineno"], reverse=True):
+        ru_idx = f["ru_lineno"] - 1
+        if marked[ru_idx] == f["new_en"]:
+            continue  # already marked on an earlier (uncommitted) run -- idempotent no-op
+        old_ru = marked[ru_idx]
+        marked[ru_idx] = f["new_en"]
+        marked.insert(ru_idx + 1, f"// STALE VERSION: {old_ru}")
+        count += 1
+    return marked, count
 
 
 def ru_path_for(en_path: Path) -> Path:
@@ -238,6 +354,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("en_file", help="path to the EN .adoc file that was updated")
     parser.add_argument("-n", "--dry-run", action="store_true", help="print a diff instead of writing the RU file")
+    parser.add_argument(
+        "--since", metavar="REF",
+        help="git ref to diff the EN file against when looking for reworded (not just added) lines "
+             "(default: the last commit that touched the RU file)",
+    )
     args = parser.parse_args()
 
     en_path = Path(args.en_file)
@@ -246,20 +367,36 @@ def main():
 
     ru_path = ru_path_for(en_path)
     en_lines = read_lines(en_path)
+    ru_existed = ru_path.is_file()
 
-    if ru_path.is_file():
+    if ru_existed:
         ru_lines = read_lines(ru_path)
     else:
         print(f"NOTE: {ru_path} does not exist yet -- creating it as a full (untranslated) copy of EN.")
         ru_lines = []
 
-    merged, inserted, replaced = merge(en_lines, ru_lines)
+    merged, inserted, replaced, pairs, force_synced = merge(en_lines, ru_lines)
 
-    if merged == ru_lines:
-        print(f"OK: {ru_path} already matches the EN structure/content; nothing to do.")
-        return
+    # Structural sync only catches new/missing lines and literal-token drift.
+    # An existing sentence that was *reworded* in place (same line count) is
+    # invisible to it -- RU still reads as normal, fully-translated text, so
+    # nothing here flags it as needing attention without checking git history.
+    ref, reworded, marked = None, [], 0
+    if ru_existed:
+        ref, reworded = find_reworded_lines(en_path, ru_path, en_lines, ru_lines, pairs, force_synced, since=args.since)
+        if reworded:
+            ru_lines_marked, marked = apply_stale_markers(ru_lines, reworded)
+            if marked:
+                # Re-run the structural merge over the stale-marked RU lines so the
+                # two kinds of changes (new/missing content, reworded-in-place
+                # content) land together in a single coherent diff/write.
+                merged, inserted, replaced, pairs, force_synced = merge(en_lines, ru_lines_marked)
 
-    if args.dry_run:
+    structurally_synced = merged == ru_lines
+
+    if structurally_synced:
+        print(f"OK: {ru_path} already matches the EN structure/content; nothing to do structurally.")
+    elif args.dry_run:
         diff = difflib.unified_diff(
             ru_lines, merged,
             fromfile=str(ru_path), tofile=str(ru_path) + " (proposed)",
@@ -285,7 +422,21 @@ def main():
             print(f"  - {old}")
             print(f"  + {new}")
 
-    print("\nNext: run scripts/check_pages_translation.sh to locate the newly untranslated lines for translation.")
+    if marked:
+        print(f"\nMarked {marked} reworded line(s) (EN wording changed since {ref[:10]} on lines the aligner")
+        print("otherwise left untouched): new EN sentence copied in, old RU preserved as a `// STALE VERSION:` comment:")
+        for f in reworded:
+            if f["ru"] == f["new_en"]:
+                continue  # was already marked on an earlier run; apply_stale_markers left it alone
+            print(f"\n  EN:{f['lineno']} / RU:{f['ru_lineno']}")
+            print(f"    {f['new_en']}")
+            print(f"    // STALE VERSION: {f['ru']}")
+
+    if ru_existed and ref is None:
+        print(f"\nNOTE: no git history found for {ru_path}; skipped the reworded-line check.")
+
+    if inserted or replaced or marked:
+        print("\nNext: run scripts/check_pages_translation.sh to locate the newly untranslated lines for translation.")
 
 
 if __name__ == "__main__":
