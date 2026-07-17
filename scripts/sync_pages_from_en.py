@@ -83,6 +83,7 @@ def _is_cell_key(line):
     return False  # an ordinary sentence that just starts with an acronym
 COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
 STALE_MARK_RE = re.compile(r'^// STALE VERSION:')
+ORPHAN_MARK_RE = re.compile(r'^// POSSIBLY ORPHANED:')
 # A top-level (outside any code block) editorial comment, e.g. `// FIXME:
 # add a link once the target page exists`. These are meta notes for page
 # maintainers, never reader-facing content -- without this, a comment falls
@@ -107,6 +108,12 @@ def classify(line, stack):
     # (misplacing that line) and makes it look "orphaned" in its own report.
     if STALE_MARK_RE.match(stripped):
         return ("STALEMARK",)
+
+    # Same deal for a `// POSSIBLY ORPHANED:` marker left by a previous run
+    # right before a block of RU content with no EN counterpart -- it must
+    # not be allowed to steal a pairing slot either.
+    if ORPHAN_MARK_RE.match(stripped):
+        return ("ORPHANMARK",)
 
     if DELIM_RE.match(stripped):
         if stack and stack[-1] == stripped:
@@ -222,16 +229,17 @@ def _sync_pair(en_l, ru_l, sig_type, replaced, en_idx, force_synced):
 
 
 def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
-    # Independent EN/RU cursors, not a shared index: a STALEMARK line (from
-    # this same run's own stale-marking pass, or a leftover from an earlier
-    # one) is RU-only *by construction* -- it is never supposed to consume
-    # an EN slot or shift the positional pairing of the real content that
-    # follows it. Treating it like a generic type mismatch (as a shared-index
-    # zip would) misreads the line right after it as "new" and duplicates
-    # it, purely because the marker shifted the RU side by one.
+    # Independent EN/RU cursors, not a shared index: a STALEMARK or
+    # ORPHANMARK line (from this same run's own marking passes, or a
+    # leftover from an earlier one) is RU-only *by construction* -- it is
+    # never supposed to consume an EN slot or shift the positional pairing
+    # of the real content that follows it. Treating it like a generic type
+    # mismatch (as a shared-index zip would) misreads the line right after
+    # it as "new" and duplicates it, purely because the marker shifted the
+    # RU side by one.
     ei = ri = 0
     while ei < len(en_slice) and ri < len(ru_slice):
-        if ru_sig_slice[ri][0] == "STALEMARK":
+        if ru_sig_slice[ri][0] in ("STALEMARK", "ORPHANMARK"):
             out.append(ru_slice[ri])
             ri += 1
             continue
@@ -261,18 +269,18 @@ def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, 
             if len(ru_rest_types) > len(en_rest_types) and ru_rest_types[-len(en_rest_types):] == en_rest_types:
                 prefix_len = len(ru_rest_types) - len(en_rest_types)
                 extra = ru_slice[ri:ri + prefix_len]
+                start_pos = len(out)
                 out.extend(extra)
-                non_marker = [l for l, s in zip(extra, ru_sig_slice[ri:ri + prefix_len]) if s[0] != "STALEMARK"]
-                if non_marker:
-                    orphaned.append(non_marker)
+                orphaned.append((start_pos, extra))
                 ri += prefix_len
                 continue
             # No clean suffix alignment either -- genuinely unrelated content
             # on both sides for the rest of this span. Decouple them -- keep
             # RU's line as-is and insert EN's as new -- rather than zipping
             # positionally and silently discarding one side.
+            start_pos = len(out)
             out.append(ru_slice[ri])
-            orphaned.append([ru_slice[ri]])
+            orphaned.append((start_pos, [ru_slice[ri]]))
             out.append(en_slice[ei])
             inserted.append([en_slice[ei]])
             ei += 1
@@ -288,10 +296,9 @@ def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, 
         inserted.append(extra)
     if ri < len(ru_slice):
         extra = ru_slice[ri:]
+        start_pos = len(out)
         out.extend(extra)
-        non_marker = [l for l, s in zip(extra, ru_sig_slice[ri:]) if s[0] != "STALEMARK"]
-        if non_marker:
-            orphaned.append(non_marker)
+        orphaned.append((start_pos, extra))
 
 
 def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
@@ -331,8 +338,9 @@ def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, ins
             inserted.append(new_lines)
         elif tag == "insert":
             extra = ru_slice[j1:j2]
+            start_pos = len(out)
             out.extend(extra)
-            orphaned.append(extra)
+            orphaned.append((start_pos, extra))
         elif tag == "replace":
             _front_pair_and_append(
                 en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], ru_sig_slice[j1:j2],
@@ -352,7 +360,7 @@ def merge(en_lines, ru_lines):
     replaced = []   # list[(old, new)]
     pairs = []      # list[(en_idx, ru_idx)] -- every position where a 1:1 EN<->RU correspondence was established
     force_synced = set()  # en_idx values already auto-corrected via `replaced` -- not also "possibly stale" prose
-    orphaned = []   # list[list[str]] -- RU content structurally left with no EN counterpart at all (never deleted)
+    orphaned = []   # list[(int, list[str])] -- (start pos in `out`, RU content) with no EN counterpart at all (never deleted)
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
@@ -370,8 +378,9 @@ def merge(en_lines, ru_lines):
             # deliberately removes a whole section (e.g. a bogus option):
             # RU's now-orphaned content has nothing left to align against.
             extra = ru_lines[j1:j2]
+            start_pos = len(out)
             out.extend(extra)
-            orphaned.append(extra)
+            orphaned.append((start_pos, extra))
         elif tag == "replace":
             _align_replace_span(
                 en_lines[i1:i2], ru_lines[j1:j2], en_sigs[i1:i2], ru_sigs[j1:j2],
@@ -496,6 +505,49 @@ def apply_stale_markers(ru_lines, reworded):
     return marked, count
 
 
+ORPHAN_MARKER_TEXT = (
+    "// POSSIBLY ORPHANED: no EN counterpart found nearby -- "
+    "review whether this was intentionally removed upstream"
+)
+
+
+def _visible_orphan_offsets(block, already_reported):
+    """Offsets within an orphaned block that are genuine RU content needing
+    review -- not blank lines, not a marker/comment left by an earlier run,
+    and not already explained by another report section (e.g. content that
+    was inserted or replaced elsewhere on the page).
+    """
+    return [
+        o for o, l in enumerate(block)
+        if l.strip() and not STALE_MARK_RE.match(l.strip())
+           and not ORPHAN_MARK_RE.match(l.strip())
+           and not COMMENT_LINE_RE.match(l.strip()) and l not in already_reported
+    ]
+
+
+def apply_orphan_markers(ru_lines, orphaned, already_reported):
+    """Insert a `// POSSIBLY ORPHANED:` comment immediately before each
+    genuine orphaned block, so the flag is grep-able in the file itself the
+    same way `// STALE VERSION:` is, instead of living only in this run's
+    console output.
+    """
+    marked = list(ru_lines)
+    positions = set()
+    for start_pos, block in orphaned:
+        offsets = _visible_orphan_offsets(block, already_reported)
+        if offsets:
+            positions.add(start_pos + offsets[0])
+    count = 0
+    # Descending order so inserting a comment line doesn't shift the
+    # position of findings at smaller indices not yet applied.
+    for pos in sorted(positions, reverse=True):
+        if pos > 0 and ORPHAN_MARK_RE.match(marked[pos - 1].strip()):
+            continue  # already marked on an earlier (uncommitted) run -- idempotent no-op
+        marked.insert(pos, ORPHAN_MARKER_TEXT)
+        count += 1
+    return marked, count
+
+
 def ru_path_for(en_path: Path) -> Path:
     s = str(en_path)
     if EN_MARK not in s:
@@ -548,6 +600,35 @@ def main():
                 # two kinds of changes (new/missing content, reworded-in-place
                 # content) land together in a single coherent diff/write.
                 merged, inserted, replaced, pairs, force_synced, orphaned = merge(en_lines, ru_lines_marked)
+
+    # Drop blank lines, marker comments, and lines already explained by
+    # another report section before judging orphaned content "real". Content
+    # sitting right next to a structural change elsewhere on the page (e.g. a
+    # big block removed nearby) can get caught by the same type-mismatch
+    # fallback that flags genuine orphans, even though it was already
+    # correctly resolved (e.g. as part of a reworded-line mark) -- without
+    # this, the same line would be reported/marked twice, once correctly and
+    # once as a misleading "review this" false alarm. Computed before the
+    # orphan-marker pass below so the markers it inserts land on exactly the
+    # same lines this function's final report calls out.
+    already_reported = set()
+    for f in reworded:
+        already_reported.add(f["new_en"])
+        already_reported.add(f["ru"])
+        if f["old_en"] is not None:
+            already_reported.add(f["old_en"])
+    for old, new in replaced:
+        already_reported.add(old)
+        already_reported.add(new)
+    for block in inserted:
+        already_reported.update(block)
+
+    # Like a reworded sentence, an orphaned block reads as normal, fully-
+    # translated text and is otherwise invisible on the page itself -- mark
+    # it inline (grep-able, survives being re-opened later) the same way
+    # `// STALE VERSION:` marks a reworded line, instead of only ever
+    # appearing in this run's console output.
+    merged, orphan_marked = apply_orphan_markers(merged, orphaned, already_reported)
 
     structurally_synced = merged == ru_lines
 
@@ -603,39 +684,18 @@ def main():
     if ru_existed and ref is None:
         print(f"\nNOTE: no git history found for {ru_path}; skipped the reworded-line check.")
 
-    # Drop blank lines, stale-version marker comments, and lines already
-    # explained by another report section before judging a block "real".
-    # Content sitting right next to a structural change elsewhere on the
-    # page (e.g. a big block removed nearby) can get caught by the same
-    # type-mismatch fallback that flags genuine orphans, even though it was
-    # already correctly resolved (e.g. as part of a reworded-line mark) --
-    # without this, the same line would be reported twice, once correctly
-    # and once as a misleading "review this" false alarm.
-    already_reported = set()
-    for f in reworded:
-        already_reported.add(f["new_en"])
-        already_reported.add(f["ru"])
-        if f["old_en"] is not None:
-            already_reported.add(f["old_en"])
-    for old, new in replaced:
-        already_reported.add(old)
-        already_reported.add(new)
-    for block in inserted:
-        already_reported.update(block)
-
     real_orphaned = []
-    for block in orphaned:
-        visible = [
-            l for l in block
-            if l.strip() and not STALE_MARK_RE.match(l.strip())
-               and not COMMENT_LINE_RE.match(l.strip()) and l not in already_reported
-        ]
+    for _, block in orphaned:
+        visible = [block[o] for o in _visible_orphan_offsets(block, already_reported)]
         if visible:
             real_orphaned.append(visible)
     if real_orphaned:
         total = sum(len(b) for b in real_orphaned)
         print(f"\nPOSSIBLY ORPHANED: {total} RU line(s) across {len(real_orphaned)} block(s) have no EN counterpart")
-        print("anywhere nearby (left in place, not deleted -- review whether EN removed this on purpose):")
+        print("anywhere nearby (left in place, not deleted -- review whether EN removed this on purpose).")
+        if orphan_marked:
+            print(f"Marked {orphan_marked} of them with a `// POSSIBLY ORPHANED:` comment right before the block, "
+                  "so it's visible directly in the file:")
         for block in real_orphaned:
             for l in block:
                 print(f"  ? {l}")
