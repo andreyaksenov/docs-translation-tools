@@ -57,8 +57,30 @@ XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
 # once one row's line count drifts, alignment cascades wrong for the rest of
 # the table. Requiring 2+ leading uppercase/digit/underscore chars excludes
 # ordinary capitalized English cells like `|Yes` or `|The database ...`
-# (which have a lowercase letter right after the initial capital).
-CELL_KEY_RE = re.compile(r'^\|[A-Z][A-Z0-9_]+\b')
+# (which have a lowercase letter right after the initial capital) -- but an
+# ordinary English cell that opens with a short all-caps acronym (`|PID of
+# the coordinator ...`, `|URL of the ...`) still passes that check, so
+# _is_cell_key() below additionally requires the rest of the line to look
+# like a value placeholder/enum, not a sentence.
+CELL_KEY_RE = re.compile(r'^\|([A-Z][A-Z0-9_]+)\b(.*)$')
+CELL_KEY_PLACEHOLDER_RE = re.compile(r'''^\s*['"]?<''')
+CELL_KEY_CAPS_ONLY_RE = re.compile(r'^[A-Z0-9_,\s]+$')
+
+
+def _is_cell_key(line):
+    m = CELL_KEY_RE.match(line)
+    if not m:
+        return False
+    rest = m.group(2)
+    if not rest.strip():
+        return True  # bare identifier, e.g. `|VERSION`
+    if CELL_KEY_PLACEHOLDER_RE.match(rest):
+        return True  # placeholder value, e.g. `|HOST <coordinator_hostname>`
+    if '\\|' in rest:
+        return True  # enum alternation, e.g. `|SSL true \| false`
+    if CELL_KEY_CAPS_ONLY_RE.match(rest):
+        return True  # further literal identifiers, e.g. `|PORT_BASE, HBA_HOSTNAMES`
+    return False  # an ordinary sentence that just starts with an acronym
 COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
 STALE_MARK_RE = re.compile(r'^// STALE VERSION:')
 # A top-level (outside any code block) editorial comment, e.g. `// FIXME:
@@ -138,7 +160,7 @@ def classify(line, stack):
     # with a Latin acronym kept untranslated (e.g. `|SQL-команда...`,
     # `|HTTP-запрос...`) -- a genuine literal key cell never contains
     # Cyrillic, so require the whole line to be Cyrillic-free.
-    if CELL_KEY_RE.match(line) and not CYRILLIC_RE.search(line):
+    if not CYRILLIC_RE.search(line) and _is_cell_key(line):
         return ("CELLKEY", stripped)
 
     m = TERM_RE.match(line)
