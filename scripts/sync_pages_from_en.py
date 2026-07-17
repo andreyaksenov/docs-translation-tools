@@ -61,6 +61,12 @@ XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
 CELL_KEY_RE = re.compile(r'^\|[A-Z][A-Z0-9_]+\b')
 COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
 STALE_MARK_RE = re.compile(r'^// STALE VERSION:')
+# A top-level (outside any code block) editorial comment, e.g. `// FIXME:
+# add a link once the target page exists`. These are meta notes for page
+# maintainers, never reader-facing content -- without this, a comment falls
+# through to plain PROSE and gets reported as "new content to translate"
+# whenever EN adds one, which is just noise (comments are never translated).
+COMMENT_LINE_RE = re.compile(r'^//')
 CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
 
 # Signature types whose text is required to be byte-identical between EN and
@@ -93,6 +99,9 @@ def classify(line, stack):
         if COMMENT_IN_CODE_RE.match(line):
             return ("COMMENT",)
         return ("CODE", line)
+
+    if COMMENT_LINE_RE.match(stripped):
+        return ("COMMENT",)
 
     if stripped == "":
         return ("BLANK",)
@@ -534,10 +543,21 @@ def main():
         ru_path.write_text("\n".join(merged) + "\n", encoding="utf-8")
         print(f"Updated {ru_path}")
 
-    if inserted:
-        total = sum(len(b) for b in inserted)
-        print(f"\nInserted {total} new line(s) from EN across {len(inserted)} block(s), left untranslated:")
-        for block in inserted:
+    # Editorial comments (e.g. `// FIXME: ...`) are never reader-facing
+    # content and never need translation -- they're still written into the
+    # RU file (nothing here ever drops a line), just excluded from the
+    # "needs translation" report so a new comment doesn't read as a
+    # translation gap.
+    real_inserted = []
+    for block in inserted:
+        visible = [l for l in block if not COMMENT_LINE_RE.match(l.strip())]
+        if any(l.strip() for l in visible):
+            real_inserted.append(visible)
+
+    if real_inserted:
+        total = sum(len(b) for b in real_inserted)
+        print(f"\nInserted {total} new line(s) from EN across {len(real_inserted)} block(s), left untranslated:")
+        for block in real_inserted:
             for l in block:
                 print(f"  + {l}")
             print()
@@ -585,7 +605,8 @@ def main():
     for block in orphaned:
         visible = [
             l for l in block
-            if l.strip() and not STALE_MARK_RE.match(l.strip()) and l not in already_reported
+            if l.strip() and not STALE_MARK_RE.match(l.strip())
+               and not COMMENT_LINE_RE.match(l.strip()) and l not in already_reported
         ]
         if visible:
             real_orphaned.append(visible)
@@ -598,7 +619,7 @@ def main():
                 print(f"  ? {l}")
             print()
 
-    if inserted or replaced or marked:
+    if real_inserted or replaced or marked:
         print("\nNext: run scripts/check_pages_translation.sh to locate the newly untranslated lines for translation.")
 
 
