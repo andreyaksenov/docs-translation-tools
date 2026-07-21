@@ -90,6 +90,14 @@ Checks that every EN `pages/`/`partials/` `.adoc` file has a RU counterpart with
 
 Checks that no `pages/`/`partials/` `.adoc` file under `en/modules/ROOT` contains Cyrillic characters — catches RU text accidentally left in (or pasted into) an EN file.
 
+### No en dash in pages
+
+```bash
+./scripts/check_pages_no_en_dash.sh
+```
+
+Checks (per language) that no `pages/`/`partials/` `.adoc` file contains an en dash (`–`, U+2013) — house style uses `--` (rendered as an em dash by AsciiDoc) instead.
+
 ### Orphaned pages (not in nav)
 
 ```bash
