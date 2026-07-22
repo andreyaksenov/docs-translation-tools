@@ -1000,7 +1000,7 @@ _PRODUCT_NAMES_RE = re.compile(r'\b(?:CentOS|Ubuntu|Red Hat|RHEL)\b')
 
 _SKIP_ATTR_RE = re.compile(r'^\[.*\]$')
 _SKIP_CODESPAN_ITEM_RE = re.compile(r'^[*.\s]+`[^`]+`\s*$')
-_SKIP_BOLDITALIC_ITEM_RE = re.compile(r'^[*.\s]+\*_[^*_]+_\*(:\s*\S+)?\s*$')
+_SKIP_BOLDITALIC_ITEM_RE = re.compile(r'^[*.\s]+\*_.+_\*:?(\s*\S+)?\s*$')
 _SKIP_TABLE_CELL_RE = re.compile(r'^(\.\d+\+)?[a-z]?\|')
 _SKIP_ALLCAPS_TITLE_RE = re.compile(r'^\.[^a-z]+$')
 _SKIP_FUNC_HEADING_RE = re.compile(r'^=+\s[A-Za-z_][A-Za-z0-9_]*\(.*\)')
@@ -1088,6 +1088,7 @@ def _check_translation_pair(en_file: Path, ru_file: Path, strict: bool, report_h
     n = min(len(en_lines), len(ru_lines))
 
     in_code = None
+    in_comment_block = False
     in_cell = False
     header_printed = False
 
@@ -1101,6 +1102,12 @@ def _check_translation_pair(en_file: Path, ru_file: Path, strict: bool, report_h
         en_line = en_lines[i]
         ru_line = ru_lines[i]
         lineno = i + 1
+
+        if re.match(r'^////\s*$', en_line):
+            in_comment_block = not in_comment_block
+            continue
+        if in_comment_block:
+            continue
 
         delim = _code_delim_type(en_line)
         if delim:
