@@ -9,21 +9,22 @@ This replaces the standalone scripts/check_*.sh scripts and
 scripts/sync_pages_from_en.py with a single shareable tool.
 
 Usage:
-    docs_tool.py --check-<name> [--check-<name> ...] [-v]
-    docs_tool.py --all-checks [-v]
-    docs_tool.py --sync <path/to/en/file.adoc> [-n] [--since REF]
-    docs_tool.py --list-checks
-    docs_tool.py --list-modules
+    ./docs_tool.py --check-<name> [--check-<name> ...] [-v]
+    ./docs_tool.py --all-checks [-v]
+    ./docs_tool.py --sync <path/to/en/file.adoc> [-n] [--since REF]
+    ./docs_tool.py --list-checks
+    ./docs_tool.py --list-modules
 
-Run from the repo root. Every check scans all discovered modules (every
-directory under en/modules/ and ru/modules/) automatically -- no flag needed.
-Examples:
+Run from the repo root (use "python docs_tool.py ..." if it isn't marked
+executable, e.g. on Windows). Every check scans all discovered modules
+(every directory under en/modules/ and ru/modules/) automatically -- no
+flag needed. Examples:
 
-    docs_tool.py --check-pages-no-cyrillic
-    docs_tool.py --check-pages-broken-refs --check-pages-orphaned
-    docs_tool.py --all-checks -v
-    docs_tool.py --sync en/modules/ROOT/pages/reference/utils/analyzedb.adoc -n
-    docs_tool.py --sync en/modules/how-to/pages/manage-cluster/pam.adoc -n
+    ./docs_tool.py --check-pages-no-cyrillic
+    ./docs_tool.py --check-pages-broken-refs --check-pages-orphaned
+    ./docs_tool.py --all-checks -v
+    ./docs_tool.py --sync en/modules/ROOT/pages/reference/utils/analyzedb.adoc -n
+    ./docs_tool.py --sync en/modules/how-to/pages/manage-cluster/pam.adoc -n
 """
 import argparse
 import difflib
@@ -1692,7 +1693,7 @@ def run_sync(en_file: str, dry_run: bool, since: str = None):
             print()
 
     if real_inserted or replaced or marked:
-        print("\nNext: run docs_tool.py --check-pages-translation to locate the newly untranslated lines for translation.")
+        print("\nNext: run ./docs_tool.py --check-pages-translation to locate the newly untranslated lines for translation.")
 
 
 # --------------------------------------------------------------------------
