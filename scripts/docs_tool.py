@@ -461,6 +461,17 @@ _INCLUDE_CONTENT_RE = re.compile(
 )
 _COMPONENT_PREFIX_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*:')
 
+
+def _strip_root_slash(t: str) -> str:
+    """Antora resource-id-style targets (xref page paths, family$ include
+    paths, injectSvg targets) are always relative to their module/family
+    root -- a leading '/' some authors add for emphasis isn't filesystem
+    syntax there. Left unstripped, `root / "pages" / t` would silently
+    treat it as an absolute path and check against the OS filesystem root
+    instead of the intended file (see the toast-storage.adoc glossary
+    xref that surfaced this)."""
+    return t.lstrip("/")
+
 _HEADING_ID_RE = re.compile(r'^=+\s+(.*\S)\s*$')
 _ID_STRIP_MARKUP_RE = re.compile(r'[`*]')
 _ID_INVALID_CHARS_RE = re.compile(r'[^\w]+', re.UNICODE)
@@ -532,7 +543,7 @@ def _collect_include_partials(file: Path, root: Path, lang_module_roots=None, la
                 continue  # external component's content, not registered via --external-root
             target_root, _ = resolved
         subdir = "partials" if family == "partial" else "pages"
-        target_file = target_root / subdir / name
+        target_file = target_root / subdir / _strip_root_slash(name)
         if target_file.is_file():
             result.extend(_collect_include_partials(target_file, target_root, lang_module_roots, lang, depth + 1, seen))
     return result
@@ -651,10 +662,11 @@ def _check_refs_in_file(file: Path, root: Path, report, lang_module_roots=None, 
                     t, fragment = t.split("#", 1)
 
                 if t.endswith(".adoc"):
-                    found_root = next((cand for cand in candidate_roots if (cand / "pages" / t).is_file()), None)
+                    page_t = _strip_root_slash(t)
+                    found_root = next((cand for cand in candidate_roots if (cand / "pages" / page_t).is_file()), None)
                     if found_root is None:
                         report(file, lineno, f"xref:{t}")
-                    elif fragment and not _anchor_exists(found_root / "pages" / t, fragment, found_root, lang_module_roots, lang):
+                    elif fragment and not _anchor_exists(found_root / "pages" / page_t, fragment, found_root, lang_module_roots, lang):
                         report(file, lineno, f"xref:{t}#{fragment} (anchor not found)")
                 elif t:
                     if not any(_anchor_exists(file, t, cand, lang_module_roots, lang) for cand in candidate_roots):
@@ -673,27 +685,27 @@ def _check_refs_in_file(file: Path, root: Path, report, lang_module_roots=None, 
                     t = resolved[1]
 
                 if t.startswith("partial$"):
-                    name = t[len("partial$"):]
+                    name = _strip_root_slash(t[len("partial$"):])
                     if not any((cand / "partials" / name).is_file() for cand in candidate_roots):
                         report(file, lineno, target)
                 elif t.startswith("example$"):
-                    name = t[len("example$"):]
+                    name = _strip_root_slash(t[len("example$"):])
                     if not any((cand / "examples" / name).is_file() for cand in candidate_roots):
                         report(file, lineno, target)
                 elif t.startswith("page$"):
-                    name = t[len("page$"):]
+                    name = _strip_root_slash(t[len("page$"):])
                     if not any((cand / "pages" / name).is_file() for cand in candidate_roots):
                         report(file, lineno, target)
                 elif not (directory / t).is_file():
                     report(file, lineno, target)
 
             elif target.startswith("injectSvg::"):
-                t = target[len("injectSvg::"):]
+                t = _strip_root_slash(target[len("injectSvg::"):])
                 if not (root / "images" / t).is_file():
                     report(file, lineno, f"injectSvg::{t}")
 
             elif target.startswith("injectSvg:"):
-                t = target[len("injectSvg:"):]
+                t = _strip_root_slash(target[len("injectSvg:"):])
                 if not (root / "images" / t).is_file():
                     report(file, lineno, f"injectSvg:{t}")
 
@@ -723,7 +735,7 @@ def _build_partial_includers(module_list, lang_module_roots, lang):
                     if resolved is None:
                         continue
                     target_root, _ = resolved
-                includers.setdefault(target_root / "partials" / name, set()).add(module_root)
+                includers.setdefault(target_root / "partials" / _strip_root_slash(name), set()).add(module_root)
     return includers
 
 
