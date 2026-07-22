@@ -636,10 +636,6 @@ def _check_refs_in_file(file: Path, root: Path, report, lang_module_roots=None, 
 
             if target.startswith("xref:"):
                 t = target[len("xref:"):]
-                if t.startswith("ROOT:"):
-                    t = t[len("ROOT:"):]
-                while t.startswith(":"):
-                    t = t[1:]
                 candidate_roots = list(fallback_roots)
                 m_component = _COMPONENT_PREFIX_RE.match(t)
                 if m_component:
