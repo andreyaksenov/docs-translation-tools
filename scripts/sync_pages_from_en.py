@@ -65,9 +65,35 @@ XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
 CELL_KEY_RE = re.compile(r'^\|([A-Z][A-Z0-9_]+)\b(.*)$')
 CELL_KEY_PLACEHOLDER_RE = re.compile(r'''^\s*['"]?<''')
 CELL_KEY_CAPS_ONLY_RE = re.compile(r'^[A-Z0-9_,\s]+$')
+# A bare-word first cell in a system-catalog reference table: a lowercase
+# `snake_case` column/type identifier (`|distributed_xid`, `|segno`,
+# `|smallint`, `|xid`) or a dash placeholder (`|--`, the "no FK" marker in a
+# References column) with *nothing* else on the line. These recur on every
+# single row of every pg_catalog/gp_toolkit page and are never translated --
+# but without recognizing them, they fall through to plain PROSE exactly like
+# CELL_KEY_RE's ALL-CAPS config keys would without that check, and for the
+# same reason: PROSE is deliberately treated as incomparable across EN/RU (see
+# GENERIC_TYPES), so a whole table body ends up with the BLANK line between
+# rows as its *only* real anchor. That's one weak anchor per row, easily
+# fooled -- e.g. deleting one whole row from EN still leaves every remaining
+# BLANK matchable against any other BLANK, so difflib can pair the wrong ones
+# up and silently mispair two unrelated rows' cells against each other
+# instead of ever reporting the actually-deleted row as orphaned (confirmed
+# on gp_distributed_log.adoc: dropping the `distributed_id` row caused the
+# *unrelated, still-current* `local_transaction` row to be flagged orphaned
+# instead). Recognizing the identifier/placeholder cells as literal anchors
+# (like CELLKEY already does for ALL-CAPS keys) gives every row its own
+# real per-row anchor -- typically two (column name + type) -- so a deleted
+# row is pinpointed correctly and surrounding rows stay untouched. Requiring
+# lowercase-only and zero trailing content excludes real prose: a translated
+# RU cell is Cyrillic (never matches `[a-z]`), and an English yes/no-style
+# cell (`|Yes`) starts uppercase, so neither collides with this.
+CELL_LITERAL_RE = re.compile(r'^\|([a-z][a-z0-9_]*|-+)$')
 
 
 def _is_cell_key(line):
+    if CELL_LITERAL_RE.match(line):
+        return True  # bare catalog identifier or dash placeholder, e.g. `|distributed_xid`, `|smallint`, `|--`
     m = CELL_KEY_RE.match(line)
     if not m:
         return False
