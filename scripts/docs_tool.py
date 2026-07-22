@@ -933,7 +933,7 @@ def check_pages_orphaned(verbose=False) -> bool:
 # --------------------------------------------------------------------------
 
 _STRUCT_LINE_RE = re.compile(
-    r'^(=+ |\.[^. ]|----$|\.\.\.\.$|====$|\*\*\*\*$|\|===$|\[|include::)'
+    r'^(=+ |\.[^. ]|----$|\.\.\.\.$|====$|\*\*\*\*$|\|===$|\[.*\]$|include::)'
 )
 _STRUCT_HEADING_RE = re.compile(r'^(=+) .*')
 _STRUCT_BLOCKTITLE_RE = re.compile(r'^\.[^. ].*')
