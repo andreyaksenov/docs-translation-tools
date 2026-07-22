@@ -2,13 +2,26 @@
 
 A single Python utility for checking that the `en/` and `ru/` documentation
 trees stay in sync, and for syncing a RU page's structure after an EN edit.
-Run it from the repo root. Requires Python 3.7+ (no third-party dependencies).
+Run it from the root of the Antora docs repo you want to check. Requires
+Python 3.7+ (no third-party dependencies) -- nothing to install.
 
 Works on both single-module Antora sites (just `en/modules/ROOT`, like this
 repo) and multi-module ones (`en/modules/ROOT`, `en/modules/how-to`, ...) --
 every module under `en/modules/` and `ru/modules/` is auto-discovered, and
 every check scans all of them. Run `scripts/docs_tool.py --list-modules` to
 see what was found.
+
+## Get it
+
+It's a single self-contained file -- copy it into any Antora docs repo (its
+own `scripts/` directory, or wherever you like) without cloning this repo:
+
+```bash
+curl -O https://raw.githubusercontent.com/andreyaksenov/docs-translation-tools/main/scripts/docs_tool.py
+chmod +x docs_tool.py
+```
+
+(Source: <https://github.com/andreyaksenov/docs-translation-tools/tree/main/scripts>.)
 
 If it lost its executable bit (for example, after downloading or copying the
 folder), restore it with:
