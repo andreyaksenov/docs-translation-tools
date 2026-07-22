@@ -1,0 +1,1525 @@
+#!/usr/bin/env python3
+"""
+docs_tool.py -- unified consistency-check and EN->RU sync utility for
+Antora documentation trees laid out as en/modules/<module>/... and
+ru/modules/<module>/... (single-module sites with just a ROOT module work
+the same way -- there's simply one module to discover).
+
+This replaces the standalone scripts/check_*.sh scripts and
+scripts/sync_pages_from_en.py with a single shareable tool.
+
+Usage:
+    docs_tool.py --check-<name> [--check-<name> ...] [-v]
+    docs_tool.py --all-checks [-v]
+    docs_tool.py --sync <path/to/en/file.adoc> [-n] [--since REF]
+    docs_tool.py --list-checks
+    docs_tool.py --list-modules
+
+Run from the repo root. Every check scans all discovered modules (every
+directory under en/modules/ and ru/modules/) automatically -- no flag needed.
+Examples:
+
+    docs_tool.py --check-pages-no-cyrillic
+    docs_tool.py --check-pages-broken-refs --check-pages-orphaned
+    docs_tool.py --all-checks -v
+    docs_tool.py --sync en/modules/ROOT/pages/reference/utils/analyzedb.adoc -n
+    docs_tool.py --sync en/modules/how-to/pages/manage-cluster/pam.adoc -n
+"""
+import argparse
+import difflib
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+EN_MODULES_ROOT = Path("en/modules")
+RU_MODULES_ROOT = Path("ru/modules")
+
+CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
+EN_EM_DASH_RE = re.compile(r'[–—]')
+
+
+# --------------------------------------------------------------------------
+# Module discovery
+# --------------------------------------------------------------------------
+
+def discover_module_names():
+    """Every module directory found under en/modules/ and/or ru/modules/,
+    sorted for stable output. A single-module site (just en/modules/ROOT)
+    yields ["ROOT"]; a multi-module Antora site yields every module
+    (ROOT, concept, how-to, ...) whether or not it has a RU counterpart yet
+    (a missing RU module still produces useful MISSING findings)."""
+    names = set()
+    for base in (EN_MODULES_ROOT, RU_MODULES_ROOT):
+        if base.is_dir():
+            names.update(p.name for p in base.iterdir() if p.is_dir())
+    return sorted(names)
+
+
+def module_roots():
+    """Yield (module_name, en_root, ru_root) for every discovered module."""
+    for name in discover_module_names():
+        yield name, EN_MODULES_ROOT / name, RU_MODULES_ROOT / name
+
+
+# --------------------------------------------------------------------------
+# Shared helpers
+# --------------------------------------------------------------------------
+
+def _read_lines(path: Path):
+    """Read a text file as a list of lines (no trailing newlines), tolerating
+    encoding issues the way the shell tools (grep/perl -CSD) silently did."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, UnicodeError):
+        return None
+
+
+def _read_text(path: Path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _iter_files(root: Path, suffix: str = None):
+    """Yield all files under root (recursively), optionally filtered by
+    suffix (e.g. '.adoc'). Sorted for stable, reproducible output."""
+    if not root.is_dir():
+        return
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and (suffix is None or p.suffix == suffix):
+            yield p
+
+
+def _labeled_unified_diff(en_lines, ru_lines, en_label, ru_label, n=1):
+    """Render a unified diff with each changed line prefixed by its source
+    file label, matching the `sed -e "s|^-|- $en_file:  |" ...` treatment
+    used throughout the original shell scripts so findings are easy to jump
+    to directly from the terminal."""
+    diff = difflib.unified_diff(en_lines, ru_lines, lineterm="", n=n)
+    out = []
+    for line in diff:
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("-"):
+            out.append(f"    - {en_label}:  {line[1:]}")
+        elif line.startswith("+"):
+            out.append(f"    + {ru_label}:  {line[1:]}")
+        else:
+            out.append(f"          {line[1:] if line.startswith(' ') else line}")
+    return out
+
+
+# --------------------------------------------------------------------------
+# EXAMPLES checks
+# --------------------------------------------------------------------------
+
+def check_examples_no_cyrillic(verbose=False) -> bool:
+    """Port of check_examples_no_cyrillic.sh: no Cyrillic in en/ examples
+    (checked across every module)."""
+    ok = True
+    for _, en_root, _ in module_roots():
+        for f in _iter_files(en_root / "examples"):
+            lines = _read_lines(f)
+            if lines is None:
+                continue
+            hits = [(i, l) for i, l in enumerate(lines, 1) if CYRILLIC_RE.search(l)]
+            if hits:
+                ok = False
+                print(f"FILE     {f}")
+                for i, l in hits:
+                    print(f"  line {i}: {l}")
+    if ok:
+        print("OK: no Cyrillic characters found in en/ examples.")
+    return ok
+
+
+def check_examples_orphaned(verbose=False) -> bool:
+    """Port of check_examples_orphaned.sh: every examples/ file must be
+    pulled in by an include::example$<path>[] somewhere in that module's
+    pages/partials."""
+    ok = True
+    for _, en_root, ru_root in module_roots():
+        for root in (en_root, ru_root):
+            examples_root = root / "examples"
+            if not examples_root.is_dir():
+                continue
+            corpus_parts = []
+            for d in (root / "pages", root / "partials"):
+                for f in _iter_files(d):
+                    text = _read_text(f)
+                    if text is not None:
+                        corpus_parts.append(text)
+            corpus = "\n".join(corpus_parts)
+            for f in _iter_files(examples_root):
+                rel = f.relative_to(examples_root).as_posix()
+                needle = f"example$${rel}".replace("$$", "$")
+                if needle not in corpus:
+                    ok = False
+                    print(f"ORPHANED  {f}  (not included in any pages/partials)")
+    if ok:
+        print("OK: all examples are included somewhere.")
+    return ok
+
+
+_COMMENT_STRIP_RE = re.compile(r'[ \t]+--([ \t].*)?$')
+
+
+def _blank_sql_comments(text: str):
+    """Port of the awk `blank_comments` helper: blanks out comment-only
+    lines (-- line comments and /* ... */ blocks) so translated SQL
+    comments don't count as content drift, while still comparing actual
+    code lines (including indentation) verbatim."""
+    out = []
+    in_comment = False
+    for line in text.splitlines():
+        trimmed = line.strip()
+        if in_comment:
+            out.append("")
+            if "*/" in trimmed:
+                in_comment = False
+            continue
+        if trimmed == "" or trimmed.startswith("--"):
+            out.append("")
+            continue
+        if trimmed.startswith("/*"):
+            out.append("")
+            if "*/" not in trimmed:
+                in_comment = True
+            continue
+        out.append(_COMMENT_STRIP_RE.sub("", line))
+    return out
+
+
+def check_examples_parity(verbose=False) -> bool:
+    """Port of check_examples_parity.sh: en/ru examples must have the same
+    files (per module); non-.sql files must match byte-for-byte, .sql files
+    only need to match once comment-only lines are blanked out."""
+    ok = True
+
+    def skip(f: Path, base: Path):
+        return "_demo_cluster" in f.relative_to(base).parts
+
+    for _, en_root, ru_root in module_roots():
+        en_examples = en_root / "examples"
+        ru_examples = ru_root / "examples"
+
+        for en_file in _iter_files(en_examples):
+            if skip(en_file, en_examples):
+                continue
+            rel = en_file.relative_to(en_examples)
+            ru_file = ru_examples / rel
+            if not ru_file.is_file():
+                print(f"MISSING  {en_file}  (no ru counterpart)")
+                ok = False
+                continue
+
+            if en_file.suffix == ".sql":
+                en_text = _read_text(en_file) or ""
+                ru_text = _read_text(ru_file) or ""
+                en_blanked = _blank_sql_comments(en_text)
+                ru_blanked = _blank_sql_comments(ru_text)
+                if en_blanked != ru_blanked:
+                    print(f"DIFF     {en_file}")
+                    print(f"         {ru_file}")
+                    ok = False
+                    if verbose:
+                        print("\n".join(_labeled_unified_diff(en_blanked, ru_blanked, en_file, ru_file)))
+                        print()
+                continue
+
+            en_bytes = en_file.read_bytes()
+            ru_bytes = ru_file.read_bytes()
+            if en_bytes != ru_bytes:
+                print(f"DIFF     {en_file}")
+                print(f"         {ru_file}")
+                ok = False
+                if verbose:
+                    en_lines = (_read_text(en_file) or "").splitlines()
+                    ru_lines = (_read_text(ru_file) or "").splitlines()
+                    print("\n".join(_labeled_unified_diff(en_lines, ru_lines, en_file, ru_file)))
+                    print()
+
+        for ru_file in _iter_files(ru_examples):
+            if skip(ru_file, ru_examples):
+                continue
+            rel = ru_file.relative_to(ru_examples)
+            if not (en_examples / rel).is_file():
+                print(f"MISSING  {ru_file}  (no en counterpart)")
+                ok = False
+
+    if ok:
+        print("OK: en/ru examples match.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# IMAGES checks
+# --------------------------------------------------------------------------
+
+def check_images_orphaned(verbose=False) -> bool:
+    """Port of check_images_orphaned.sh: every images/ file's basename must
+    be referenced somewhere in that module's pages/partials."""
+    ok = True
+    for _, en_root, ru_root in module_roots():
+        for root in (en_root, ru_root):
+            images_root = root / "images"
+            if not images_root.is_dir():
+                continue
+            corpus_parts = []
+            for d in (root / "pages", root / "partials"):
+                for f in _iter_files(d):
+                    text = _read_text(f)
+                    if text is not None:
+                        corpus_parts.append(text)
+            corpus = "\n".join(corpus_parts)
+            for f in _iter_files(images_root):
+                if f.name not in corpus:
+                    ok = False
+                    print(f"ORPHANED  {f}  (not referenced in any pages/partials)")
+    if ok:
+        print("OK: all images are referenced somewhere.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# NAV checks
+# --------------------------------------------------------------------------
+
+_NAV_SVG_RE = re.compile(r'^(\*+)\s\+\+\+<svg><use xlink:href="[^"]*#([^"]+)"')
+_NAV_XREF_RE = re.compile(r'^(\*+)\s+xref:([^\[]+)\[')
+_NAV_LISTITEM_RE = re.compile(r'^(\*+)\s')
+_NAV_INCLUDE_RE = re.compile(r'^include::(.*)$')
+_INCLUDE_PARTIAL_RE = re.compile(r'include::partial\$([^\[]+\.adoc)')
+
+
+def _nav_skeleton(path: Path):
+    """Structural skeleton of a nav file: list depth + xref/include target,
+    or an <svg:...>/<text> placeholder. Numbered lines (1-based) for -v
+    lookup; caller strips the number prefix for the plain equality check."""
+    lines = _read_lines(path)
+    if lines is None:
+        return []
+    out = []
+    for lineno, line in enumerate(lines, 1):
+        m = _NAV_SVG_RE.match(line)
+        if m:
+            out.append((lineno, f"{m.group(1)} <svg:{m.group(2)}>"))
+            continue
+        m = _NAV_XREF_RE.match(line)
+        if m:
+            out.append((lineno, f"{m.group(1)} xref:{m.group(2)}"))
+            continue
+        m = _NAV_LISTITEM_RE.match(line)
+        if m:
+            out.append((lineno, f"{m.group(1)} <text>"))
+            continue
+        m = _NAV_INCLUDE_RE.match(line)
+        if m:
+            out.append((lineno, f"include::{m.group(1)}"))
+    return out
+
+
+def _compare_skeleton_pair(en_file: Path, ru_file: Path, skeleton_fn, verbose) -> bool:
+    en_skel = skeleton_fn(en_file)
+    ru_skel = skeleton_fn(ru_file)
+    en_plain = [s for _, s in en_skel]
+    ru_plain = [s for _, s in ru_skel]
+    if en_plain == ru_plain:
+        return True
+    print(f"DIFF     {en_file}")
+    print(f"         {ru_file}")
+    if verbose:
+        en_labeled = [f"{n}:{s}" for n, s in en_skel]
+        ru_labeled = [f"{n}:{s}" for n, s in ru_skel]
+        print("\n".join(_labeled_unified_diff(en_labeled, ru_labeled, en_file, ru_file)))
+        print()
+    return False
+
+
+def check_nav_structure_parity(verbose=False) -> bool:
+    """Port of check_nav_structure_parity.sh. A module only has a nav.adoc
+    of its own on some multi-module Antora sites (e.g. a top-level ROOT nav
+    plus a second one for a "how-to" module); modules without one are
+    silently skipped."""
+    ok = True
+    any_nav = False
+    for _, en_root, ru_root in module_roots():
+        en_nav = en_root / "nav.adoc"
+        ru_nav = ru_root / "nav.adoc"
+        if not (en_nav.is_file() and ru_nav.is_file()):
+            continue
+        any_nav = True
+        if not _compare_skeleton_pair(en_nav, ru_nav, _nav_skeleton, verbose):
+            ok = False
+
+        en_text = _read_text(en_nav) or ""
+        for partial_name in _INCLUDE_PARTIAL_RE.findall(en_text):
+            en_partial = en_root / "partials" / partial_name
+            ru_partial = ru_root / "partials" / partial_name
+            if en_partial.is_file() and ru_partial.is_file():
+                if not _compare_skeleton_pair(en_partial, ru_partial, _nav_skeleton, verbose):
+                    ok = False
+
+    if not any_nav:
+        print("OK: no nav.adoc found to compare.")
+    elif ok:
+        print("OK: nav structure matches for en/ru.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# PAGES: broken references
+# --------------------------------------------------------------------------
+
+_REF_SCAN_RE = re.compile(r'(?:xref:|include::|injectSvg:{1,2})[^\]\[\s]+\[')
+_ANCHOR_ID_TPL = r'^\[#{0}\]$|^\[\[{0}(,|\]\])'
+_INCLUDE_PARTIAL_ANY_RE = re.compile(r'include::partial\$([^\[]+\.adoc)')
+_COMPONENT_PREFIX_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*:')
+
+
+def _collect_include_partials(file: Path, root: Path, depth=0, seen=None):
+    """A page's anchors may live in include::partial$...[] partials it pulls
+    in (recursively), not its own source. Depth-capped to guard against an
+    accidental include cycle."""
+    if seen is None:
+        seen = set()
+    if depth > 5 or file in seen:
+        return []
+    seen.add(file)
+    result = [file]
+    text = _read_text(file)
+    if text is None:
+        return result
+    for partial_name in _INCLUDE_PARTIAL_ANY_RE.findall(text):
+        partial_file = root / "partials" / partial_name
+        if partial_file.is_file():
+            result.extend(_collect_include_partials(partial_file, root, depth + 1, seen))
+    return result
+
+
+def _anchor_exists(target_file: Path, anchor_id: str, root: Path) -> bool:
+    pattern = re.compile(_ANCHOR_ID_TPL.format(re.escape(anchor_id)))
+    for f in _collect_include_partials(target_file, root):
+        text = _read_text(f)
+        if text is None:
+            continue
+        for line in text.splitlines():
+            if pattern.match(line):
+                return True
+    return False
+
+
+def _excluded_ref_lines(path: Path) -> set:
+    """Line numbers to skip when scanning for references: AsciiDoc comments
+    and anything inside a ---- / .... literal/listing block."""
+    lines = _read_lines(path)
+    if lines is None:
+        return set()
+    excluded = set()
+    in_code = False
+    for lineno, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith("//"):
+            excluded.add(lineno)
+            continue
+        if re.match(r'^(----|\.\.\.\.)\s*$', line):
+            in_code = not in_code
+            excluded.add(lineno)
+            continue
+        if in_code:
+            excluded.add(lineno)
+    return excluded
+
+
+def _check_refs_in_file(file: Path, root: Path, report, lang_module_roots=None):
+    """`lang_module_roots` (name -> module root, for the same language as
+    `root`) lets a component-prefixed xref (`xref:other-module:page.adoc[]`)
+    resolve against a sibling module on multi-module Antora sites, instead
+    of always being treated as pointing outside this repo."""
+    lines = _read_lines(file)
+    if lines is None:
+        return
+    excluded = _excluded_ref_lines(file)
+    directory = file.parent
+    lang_module_roots = lang_module_roots or {}
+
+    for lineno, line in enumerate(lines, 1):
+        if lineno in excluded:
+            continue
+        for m in _REF_SCAN_RE.finditer(line):
+            target = m.group(0)[:-1]  # strip trailing '['
+
+            if target.startswith("xref:"):
+                t = target[len("xref:"):]
+                if t.startswith("ROOT:"):
+                    t = t[len("ROOT:"):]
+                while t.startswith(":"):
+                    t = t[1:]
+                target_root = root
+                m_component = _COMPONENT_PREFIX_RE.match(t)
+                if m_component:
+                    component = m_component.group(0)[:-1]  # strip trailing ':'
+                    if component in lang_module_roots:
+                        target_root = lang_module_roots[component]
+                        t = t[len(m_component.group(0)):]
+                    else:
+                        continue  # external component xref (blog::x, ...)
+
+                fragment = ""
+                if "#" in t:
+                    t, fragment = t.split("#", 1)
+
+                if t.endswith(".adoc"):
+                    target_file = target_root / "pages" / t
+                    if not target_file.is_file():
+                        report(file, lineno, f"xref:{t}")
+                    elif fragment and not _anchor_exists(target_file, fragment, target_root):
+                        report(file, lineno, f"xref:{t}#{fragment} (anchor not found)")
+                elif t:
+                    if not _anchor_exists(file, t, target_root):
+                        report(file, lineno, f"xref:{t} (anchor not found)")
+
+            elif target.startswith("include::partial$"):
+                t = target[len("include::partial$"):]
+                if not (root / "partials" / t).is_file():
+                    report(file, lineno, f"include::partial${t}")
+
+            elif target.startswith("include::example$"):
+                t = target[len("include::example$"):]
+                if not (root / "examples" / t).is_file():
+                    report(file, lineno, f"include::example${t}")
+
+            elif target.startswith("include::"):
+                t = target[len("include::"):]
+                if not (directory / t).is_file():
+                    report(file, lineno, f"include::{t}")
+
+            elif target.startswith("injectSvg::"):
+                t = target[len("injectSvg::"):]
+                if not (root / "images" / t).is_file():
+                    report(file, lineno, f"injectSvg::{t}")
+
+            elif target.startswith("injectSvg:"):
+                t = target[len("injectSvg:"):]
+                if not (root / "images" / t).is_file():
+                    report(file, lineno, f"injectSvg:{t}")
+
+
+def check_pages_broken_refs(verbose=False) -> bool:
+    """Port of check_pages_broken_refs.sh, extended to resolve
+    component-prefixed xrefs against sibling modules of the same language
+    when the component name matches a discovered module."""
+    ok = True
+
+    def report(file, lineno, msg):
+        nonlocal ok
+        ok = False
+        print(f"BROKEN   {file}:{lineno}  {msg}")
+
+    modules = list(module_roots())
+    en_module_roots = {name: en_root for name, en_root, _ in modules}
+    ru_module_roots = {name: ru_root for name, _, ru_root in modules}
+
+    for _, en_root, ru_root in modules:
+        for root, lang_module_roots in ((en_root, en_module_roots), (ru_root, ru_module_roots)):
+            for f in list(_iter_files(root / "pages", ".adoc")) + list(_iter_files(root / "partials", ".adoc")):
+                _check_refs_in_file(f, root, report, lang_module_roots)
+
+    if ok:
+        print("OK: no broken xref/include/image references found.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# PAGES: line parity
+# --------------------------------------------------------------------------
+
+def check_pages_line_parity(verbose=False) -> bool:
+    """Port of check_pages_line_parity.sh (matches `wc -l` semantics: counts
+    newline characters, not logical/visual lines)."""
+    ok = True
+    for _, en_root, ru_root in module_roots():
+        for subdir in ("pages", "partials"):
+            for en_file in _iter_files(en_root / subdir, ".adoc"):
+                rel = en_file.relative_to(en_root)
+                ru_file = ru_root / rel
+                if not ru_file.is_file():
+                    print(f"MISSING  {en_file}  (no ru counterpart)")
+                    ok = False
+                    continue
+                en_n = (_read_text(en_file) or "").count("\n")
+                ru_n = (_read_text(ru_file) or "").count("\n")
+                if en_n != ru_n:
+                    print(f"DIFF     {en_file}  ({en_n} lines)")
+                    print(f"         {ru_file}  ({ru_n} lines)")
+                    ok = False
+
+            for ru_file in _iter_files(ru_root / subdir, ".adoc"):
+                rel = ru_file.relative_to(ru_root)
+                if not (en_root / rel).is_file():
+                    print(f"MISSING  {ru_file}  (no en counterpart)")
+                    ok = False
+
+    if ok:
+        print("OK: all compared en/ru pages have matching line counts.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# PAGES: no Cyrillic / no unicode dashes
+# --------------------------------------------------------------------------
+
+def check_pages_no_cyrillic(verbose=False) -> bool:
+    """Port of check_pages_no_cyrillic.sh (en/ only, all modules)."""
+    ok = True
+    for _, en_root, _ in module_roots():
+        for f in list(_iter_files(en_root / "pages", ".adoc")) + list(_iter_files(en_root / "partials", ".adoc")):
+            lines = _read_lines(f)
+            if lines is None:
+                continue
+            hits = [(i, l) for i, l in enumerate(lines, 1) if CYRILLIC_RE.search(l)]
+            if hits:
+                ok = False
+                print(f"FILE     {f}")
+                for i, l in hits:
+                    print(f"  line {i}: {l}")
+    if ok:
+        print("OK: no Cyrillic characters found in en/ pages.")
+    return ok
+
+
+def check_pages_no_unicode_dashes(verbose=False) -> bool:
+    """Port of check_pages_no_unicode_dashes.sh (en/ and ru/, all modules)."""
+    ok = True
+    for _, en_root, ru_root in module_roots():
+        for root in (en_root, ru_root):
+            for f in list(_iter_files(root / "pages", ".adoc")) + list(_iter_files(root / "partials", ".adoc")):
+                lines = _read_lines(f)
+                if lines is None:
+                    continue
+                hits = [(i, l) for i, l in enumerate(lines, 1) if EN_EM_DASH_RE.search(l)]
+                if hits:
+                    ok = False
+                    print(f"FILE     {f}")
+                    for i, l in hits:
+                        print(f"  line {i}: {l}")
+    if ok:
+        print("OK: no en dash (–) or em dash (—) characters found in pages.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# PAGES: orphaned (not reachable from nav.adoc)
+# --------------------------------------------------------------------------
+
+_START_PAGE_RE = re.compile(r'^start_page:\s*(?:([\w-]+):)?(\S+)', re.MULTILINE)
+_COMMENT_LINE_ONLY_RE = re.compile(r'^\s*//')
+
+
+def _strip_comment_lines(text: str) -> str:
+    return "\n".join(l for l in text.splitlines() if not _COMMENT_LINE_ONLY_RE.match(l))
+
+
+def _parse_start_page(antora_yml: Path):
+    """Returns (module_name, page_rel) for antora.yml's start_page, or
+    (None, None) if not found. Antora defaults an unqualified start_page
+    (no "module:" prefix) to the ROOT module."""
+    antora_text = _read_text(antora_yml)
+    if not antora_text:
+        return None, None
+    m = _START_PAGE_RE.search(antora_text)
+    if not m:
+        return None, None
+    module = m.group(1) or "ROOT"
+    return module, m.group(2).strip()
+
+
+def _combined_nav_text(root: Path) -> str:
+    """A module's own nav.adoc plus any include::partial$...[] partials it
+    pulls in, comments stripped."""
+    nav = root / "nav.adoc"
+    nav_text = _read_text(nav)
+    if nav_text is None:
+        return ""
+    parts = [_strip_comment_lines(nav_text)]
+    for partial_name in _INCLUDE_PARTIAL_RE.findall(nav_text):
+        partial_text = _read_text(root / "partials" / partial_name)
+        if partial_text is not None:
+            parts.append(_strip_comment_lines(partial_text))
+    return "\n".join(parts)
+
+
+def check_pages_orphaned(verbose=False) -> bool:
+    """Port of check_pages_orphaned.sh, generalized for multi-module Antora
+    sites: a page is considered reachable if *any* module's nav.adoc (they
+    can cross-reference each other, e.g. `xref:other-module:page.adoc[]`)
+    contains an xref to it, either bare (same-module/default-component form)
+    or module-qualified."""
+    ok = True
+    modules = list(module_roots())
+
+    for lang_attr in ("en_root", "ru_root"):
+        idx = 0 if lang_attr == "en_root" else 1
+        lang_roots = {name: (en_root, ru_root)[idx] for name, en_root, ru_root in modules}
+        modules_root = EN_MODULES_ROOT if idx == 0 else RU_MODULES_ROOT
+        antora_yml = modules_root.parent / "antora.yml"
+        start_module, start_page = _parse_start_page(antora_yml)
+
+        # Union of every module's nav (a page can be linked from a sibling
+        # module's nav via a component-qualified xref, not just its own).
+        combined_nav_text = "\n".join(_combined_nav_text(r) for r in lang_roots.values() if (r / "nav.adoc").is_file())
+        if not combined_nav_text:
+            continue
+
+        for name, root in lang_roots.items():
+            for f in _iter_files(root / "pages", ".adoc"):
+                rel = f.relative_to(root / "pages").as_posix()
+                if start_module == name and start_page == rel:
+                    continue
+                if f"xref:{rel}" in combined_nav_text or f"xref:{name}:{rel}" in combined_nav_text:
+                    continue
+                ok = False
+                print(f"ORPHANED  {f}  (not referenced in any nav.adoc)")
+
+    if ok:
+        print("OK: all pages are referenced in nav.adoc.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# PAGES: structure parity (EN vs RU)
+# --------------------------------------------------------------------------
+
+_STRUCT_LINE_RE = re.compile(
+    r'^(=+ |\.[^. ]|----$|\.\.\.\.$|====$|\*\*\*\*$|\|===$|\[|include::)'
+)
+_STRUCT_HEADING_RE = re.compile(r'^(=+) .*')
+_STRUCT_BLOCKTITLE_RE = re.compile(r'^\.[^. ].*')
+
+
+def _structure_skeleton(path: Path):
+    lines = _read_lines(path)
+    if lines is None:
+        return []
+    out = []
+    for lineno, line in enumerate(lines, 1):
+        if not _STRUCT_LINE_RE.match(line):
+            continue
+        m = _STRUCT_HEADING_RE.match(line)
+        if m:
+            out.append((lineno, f"{m.group(1)} <heading>"))
+            continue
+        if _STRUCT_BLOCKTITLE_RE.match(line):
+            out.append((lineno, ".<block title>"))
+            continue
+        out.append((lineno, line))
+    return out
+
+
+def check_pages_structure_parity(verbose=False) -> bool:
+    """Port of check_pages_structure_parity.sh."""
+    ok = True
+    for _, en_root, ru_root in module_roots():
+        for subdir in ("pages", "partials"):
+            for en_file in _iter_files(en_root / subdir, ".adoc"):
+                rel = en_file.relative_to(en_root)
+                ru_file = ru_root / rel
+                if not ru_file.is_file():
+                    print(f"MISSING  {en_file}  (no ru counterpart)")
+                    ok = False
+                    continue
+                if not _compare_skeleton_pair(en_file, ru_file, _structure_skeleton, verbose):
+                    ok = False
+
+            for ru_file in _iter_files(ru_root / subdir, ".adoc"):
+                rel = ru_file.relative_to(ru_root)
+                if not (en_root / rel).is_file():
+                    print(f"MISSING  {ru_file}  (no en counterpart)")
+                    ok = False
+
+    if ok:
+        print("OK: en/ru structure matches for all compared files.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# PAGES: untranslated-line heuristic
+# --------------------------------------------------------------------------
+
+_STOPWORDS = (
+    "the|is|are|and|or|with|this|that|these|those|you|your|for|from|into|"
+    "when|where|which|while|because|however|therefore|then|than|been|have|"
+    "has|had|will|would|should|could|can|not|but|also|each|such|only|about|"
+    "between|through|before|after|during|without|within|both|either|neither|"
+    "more|most|some|any|all|other|same|its|their|our"
+)
+_STOPWORDS_RE = re.compile(rf'\b(?:{_STOPWORDS})\b')
+_PRODUCT_NAMES_RE = re.compile(r'\b(?:CentOS|Ubuntu|Red Hat|RHEL)\b')
+
+_SKIP_ATTR_RE = re.compile(r'^\[.*\]$')
+_SKIP_CODESPAN_ITEM_RE = re.compile(r'^[*.\s]+`[^`]+`\s*$')
+_SKIP_TABLE_CELL_RE = re.compile(r'^(\.\d+\+)?[a-z]?\|')
+_SKIP_ALLCAPS_TITLE_RE = re.compile(r'^\.[^a-z]+$')
+_SKIP_FUNC_HEADING_RE = re.compile(r'^=+\s[A-Za-z_][A-Za-z0-9_]*\(.*\)')
+_LOWERCASE_RE = re.compile(r'[a-z]')
+_HEADING_RE = re.compile(r'^=+\s')
+
+_STRIP_CODE_SPAN_RE = re.compile(r'`[^`]*`')
+_STRIP_PLACEHOLDER_RE = re.compile(r'<[^>]*>')
+_STRIP_DOUBLE_ANGLE_RE = re.compile(r'<<[^>]*>>')
+_STRIP_BRACKET_RE = re.compile(r'\[[^\]]*\]')
+_STRIP_PAREN_RE = re.compile(r'\([^)]*\)')
+_STRIP_BOLD_RE = re.compile(r'\*\*[^*]*\*\*')
+_STRIP_BOLDITALIC_RE = re.compile(r'\*_[^*_]*_\*')
+_STRIP_ITALIC_RE = re.compile(r'_[^_]*_')
+_STRIP_XREF_RE = re.compile(r'xref:\S*')
+_STRIP_URL_RE = re.compile(r'https?://\S*')
+_HYPHEN_JOIN_RE = re.compile(r'([a-z])-([a-z])')
+
+
+def _code_delim_type(line: str):
+    if re.match(r'^----\s*$', line):
+        return "dash"
+    if re.match(r'^\.\.\.\.\s*$', line):
+        return "dot"
+    return None
+
+
+def _is_skip_line(line: str) -> bool:
+    if line.strip() == "":
+        return True
+    if line.startswith(":"):
+        return True
+    if _SKIP_ATTR_RE.match(line):
+        return True
+    if line.startswith("include::"):
+        return True
+    if line.startswith("//"):
+        return True
+    if _SKIP_CODESPAN_ITEM_RE.match(line):
+        return True
+    if line[:1].isspace():
+        return True
+    if _SKIP_TABLE_CELL_RE.match(line):
+        return True
+    if _SKIP_ALLCAPS_TITLE_RE.match(line):
+        return True
+    if _SKIP_FUNC_HEADING_RE.match(line):
+        return True
+    if line.endswith("::"):
+        return True
+    if not _LOWERCASE_RE.search(line):
+        return True
+
+    stripped = _STRIP_CODE_SPAN_RE.sub("", line)
+    stripped = _STRIP_PLACEHOLDER_RE.sub("", stripped)
+    stripped = _PRODUCT_NAMES_RE.sub("", stripped)
+    if not _LOWERCASE_RE.search(stripped):
+        return True
+
+    return False
+
+
+def _strip_noise(line: str) -> str:
+    s = _STRIP_CODE_SPAN_RE.sub("", line)
+    s = _STRIP_DOUBLE_ANGLE_RE.sub("", s)
+    s = _STRIP_BRACKET_RE.sub("", s)
+    s = _STRIP_PAREN_RE.sub("", s)
+    s = _STRIP_BOLD_RE.sub("", s)
+    s = _STRIP_BOLDITALIC_RE.sub("", s)
+    s = _STRIP_ITALIC_RE.sub("", s)
+    s = _STRIP_XREF_RE.sub("", s)
+    s = _STRIP_URL_RE.sub("", s)
+    return s
+
+
+def _check_translation_pair(en_file: Path, ru_file: Path, strict: bool, report_header):
+    en_lines = _read_lines(en_file)
+    ru_lines = _read_lines(ru_file)
+    if en_lines is None or ru_lines is None:
+        return
+    n = min(len(en_lines), len(ru_lines))
+
+    in_code = None
+    in_cell = False
+    header_printed = False
+
+    def ensure_header():
+        nonlocal header_printed
+        if not header_printed:
+            report_header(ru_file)
+            header_printed = True
+
+    for i in range(n):
+        en_line = en_lines[i]
+        ru_line = ru_lines[i]
+        lineno = i + 1
+
+        delim = _code_delim_type(en_line)
+        if delim:
+            if in_code == delim:
+                in_code = None
+            elif in_code is None:
+                in_code = delim
+            continue
+        if in_code:
+            continue
+
+        if en_line.startswith("|==="):
+            in_cell = False
+        elif re.match(r'^(\.\d+\+)?a\|', en_line):
+            in_cell = True
+        elif _SKIP_TABLE_CELL_RE.match(en_line):
+            in_cell = False
+        elif in_cell:
+            continue
+
+        if _is_skip_line(en_line):
+            continue
+
+        if len(en_line.split()) < 3:
+            continue
+
+        if en_line == ru_line:
+            ensure_header()
+            print(f"  UNTRANSLATED  line {lineno}: {en_line}")
+        elif strict and not _HEADING_RE.match(en_line):
+            candidate = _strip_noise(ru_line).lower()
+            candidate = _HYPHEN_JOIN_RE.sub(r'\1\2', candidate)
+            if _STOPWORDS_RE.search(candidate):
+                ensure_header()
+                print(f"  SUSPECT       line {lineno}: {ru_line}")
+
+
+def check_pages_translation(verbose=False) -> bool:
+    """Port of check_pages_translation.sh. `verbose` enables the stricter
+    stopword-based heuristic (the script's `-v` flag)."""
+    ok = True
+
+    def report_header(ru_file):
+        nonlocal ok
+        ok = False
+        print(f"FILE     {ru_file}")
+
+    for _, en_root, ru_root in module_roots():
+        for subdir in ("pages", "partials"):
+            for en_file in _iter_files(en_root / subdir, ".adoc"):
+                rel = en_file.relative_to(en_root)
+                ru_file = ru_root / rel
+                if not ru_file.is_file():
+                    continue
+                _check_translation_pair(en_file, ru_file, verbose, report_header)
+
+    if ok:
+        print("OK: no untranslated lines detected.")
+    return ok
+
+
+# --------------------------------------------------------------------------
+# CHECK REGISTRY
+# --------------------------------------------------------------------------
+
+CHECKS = {
+    "examples-no-cyrillic": check_examples_no_cyrillic,
+    "examples-orphaned": check_examples_orphaned,
+    "examples-parity": check_examples_parity,
+    "images-orphaned": check_images_orphaned,
+    "nav-structure-parity": check_nav_structure_parity,
+    "pages-broken-refs": check_pages_broken_refs,
+    "pages-line-parity": check_pages_line_parity,
+    "pages-no-cyrillic": check_pages_no_cyrillic,
+    "pages-no-unicode-dashes": check_pages_no_unicode_dashes,
+    "pages-orphaned": check_pages_orphaned,
+    "pages-structure-parity": check_pages_structure_parity,
+    "pages-translation": check_pages_translation,
+}
+
+
+# ==========================================================================
+# SYNC: align a RU page's structure/content with its EN counterpart after an
+# EN edit. Ported from sync_pages_from_en.py -- see that tool's original
+# docstring (preserved below) for the detailed design rationale.
+# ==========================================================================
+"""
+Never touches the EN file. Aligns the RU file's structural "skeleton"
+(headings, anchors, delimited blocks, option/flag terms, code lines) to EN's,
+and copies in new or changed EN lines verbatim (left untranslated) wherever
+RU has nothing corresponding yet. Existing RU prose is never rewritten or
+removed -- only technical tokens that must be byte-identical across
+languages (flag names, code/command lines, include paths, ids) are corrected
+when they've drifted (e.g. a stale `plpythonu` left behind after EN moved to
+`plpython3u`).
+"""
+
+EN_MARK = "en/modules/"
+RU_MARK = "ru/modules/"
+
+DELIM_RE = re.compile(r'^(?:-{2}|-{4,}|\.{4,}|={4,}|\*{4,}|\|={3,})$')
+CODE_DELIM_RE = re.compile(r'^(?:-{4,}|\.{4,})$')
+
+HEADING_RE = re.compile(r'^(=+)\s+\S')
+ID_RE = re.compile(r'^\[#([\w-]+)]\s*$')
+DOCATTR_RE = re.compile(r'^:([\w-]+):')
+ATTR_RE = re.compile(r'^\[[^\[\]].*]\s*$')
+INCLUDE_RE = re.compile(r'^include::')
+BLOCKTITLE_RE = re.compile(r'^\.[^.\s]')
+TERM_RE = re.compile(r'^(\[\[[\w-]+])?(.+)::\s*$')
+ALL_CAPS_TERM_RE = re.compile(r'^[A-Z][A-Z0-9_]*(\s*,\s*[A-Z][A-Z0-9_]*)*$')
+XREF_ITEM_RE = re.compile(r'^[*.]+\s*xref:([^\[]+)\[[^\]]*]\s*$')
+
+CELL_KEY_RE = re.compile(r'^\|([A-Z][A-Z0-9_]+)\b(.*)$')
+CELL_KEY_PLACEHOLDER_RE = re.compile(r'''^\s*['"]?<''')
+CELL_KEY_CAPS_ONLY_RE = re.compile(r'^[A-Z0-9_,\s]+$')
+CELL_LITERAL_RE = re.compile(r'^\|([a-z][a-z0-9_]*|-+)$')
+
+
+def _is_cell_key(line):
+    if CELL_LITERAL_RE.match(line):
+        return True
+    m = CELL_KEY_RE.match(line)
+    if not m:
+        return False
+    rest = m.group(2)
+    if not rest.strip():
+        return True
+    if CELL_KEY_PLACEHOLDER_RE.match(rest):
+        return True
+    if '\\|' in rest:
+        return True
+    if CELL_KEY_CAPS_ONLY_RE.match(rest):
+        return True
+    return False
+
+
+COMMENT_IN_CODE_RE = re.compile(r'^\s*(#|--|//)\s')
+STALE_MARK_RE = re.compile(r'^// STALE VERSION:')
+ORPHAN_MARK_RE = re.compile(r'^// POSSIBLY ORPHANED:')
+COMMENT_LINE_RE = re.compile(r'^//')
+SYNC_CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
+
+FORCE_SYNC_TYPES = {"DELIM", "ID", "ATTR", "INCLUDE", "TERM", "CODE", "CONT", "CELLKEY"}
+
+
+def sync_classify(line, stack):
+    stripped = line.strip()
+
+    if STALE_MARK_RE.match(stripped):
+        return ("STALEMARK",)
+    if ORPHAN_MARK_RE.match(stripped):
+        return ("ORPHANMARK",)
+
+    if DELIM_RE.match(stripped):
+        if stack and stack[-1] == stripped:
+            stack.pop()
+        else:
+            stack.append(stripped)
+        return ("DELIM", stripped)
+
+    if stack and CODE_DELIM_RE.match(stack[-1]):
+        if stripped == "":
+            return ("BLANK",)
+        if COMMENT_IN_CODE_RE.match(line):
+            return ("COMMENT",)
+        return ("CODE", line)
+
+    if COMMENT_LINE_RE.match(stripped):
+        return ("COMMENT",)
+
+    if stripped == "":
+        return ("BLANK",)
+
+    if stripped == "+":
+        return ("CONT", "+")
+
+    m = HEADING_RE.match(line)
+    if m:
+        return ("HEADING", len(m.group(1)))
+
+    m = ID_RE.match(line)
+    if m:
+        return ("ID", m.group(1))
+
+    m = DOCATTR_RE.match(line)
+    if m:
+        return ("DOCATTR", m.group(1))
+
+    if ATTR_RE.match(line):
+        return ("ATTR", line)
+
+    if INCLUDE_RE.match(line):
+        return ("INCLUDE", line)
+
+    m = XREF_ITEM_RE.match(line)
+    if m:
+        return ("XREFITEM", m.group(1))
+
+    if BLOCKTITLE_RE.match(line):
+        return ("BLOCKTITLE",)
+
+    if not SYNC_CYRILLIC_RE.search(line) and _is_cell_key(line):
+        return ("CELLKEY", stripped)
+
+    m = TERM_RE.match(line)
+    if m:
+        content = m.group(2).strip()
+        if content.startswith(("-", "`")) or ALL_CAPS_TERM_RE.match(content):
+            return ("TERM", line)
+        return ("TERMX",)
+
+    return ("PROSE",)
+
+
+def sync_signatures(lines):
+    stack = []
+    return [sync_classify(line, stack) for line in lines]
+
+
+GENERIC_TYPES = {"PROSE", "COMMENT", "HEADING", "BLOCKTITLE", "TERMX"}
+
+
+def matching_signatures(sigs, side):
+    out = []
+    for idx, sig in enumerate(sigs):
+        if sig[0] in GENERIC_TYPES:
+            out.append((sig[0], side, idx))
+        else:
+            out.append(sig)
+    return out
+
+
+def _sync_pair(en_l, ru_l, sig_type, replaced, en_idx, force_synced):
+    if sig_type in FORCE_SYNC_TYPES and en_l != ru_l and not SYNC_CYRILLIC_RE.search(ru_l):
+        replaced.append((ru_l, en_l))
+        force_synced.add(en_idx)
+        return en_l
+    return ru_l
+
+
+def _front_pair_and_append(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
+    ei = ri = 0
+    while ei < len(en_slice) and ri < len(ru_slice):
+        if ru_sig_slice[ri][0] in ("STALEMARK", "ORPHANMARK"):
+            out.append(ru_slice[ri])
+            ri += 1
+            continue
+        en_type, ru_type = en_sig_slice[ei][0], ru_sig_slice[ri][0]
+        if en_type != ru_type:
+            en_rest_types = [t[0] for t in en_sig_slice[ei:]]
+            ru_rest_types = [t[0] for t in ru_sig_slice[ri:]]
+            if len(en_rest_types) > len(ru_rest_types) and en_rest_types[-len(ru_rest_types):] == ru_rest_types:
+                prefix_len = len(en_rest_types) - len(ru_rest_types)
+                extra = en_slice[ei:ei + prefix_len]
+                out.extend(extra)
+                inserted.append(extra)
+                ei += prefix_len
+                continue
+            if len(ru_rest_types) > len(en_rest_types) and ru_rest_types[-len(en_rest_types):] == en_rest_types:
+                prefix_len = len(ru_rest_types) - len(en_rest_types)
+                extra = ru_slice[ri:ri + prefix_len]
+                start_pos = len(out)
+                out.extend(extra)
+                orphaned.append((start_pos, extra))
+                ri += prefix_len
+                continue
+            start_pos = len(out)
+            out.append(ru_slice[ri])
+            orphaned.append((start_pos, [ru_slice[ri]]))
+            out.append(en_slice[ei])
+            inserted.append([en_slice[ei]])
+            ei += 1
+            ri += 1
+            continue
+        out.append(_sync_pair(en_slice[ei], ru_slice[ri], en_type, replaced, en_base + ei, force_synced))
+        pairs.append((en_base + ei, ru_base + ri))
+        ei += 1
+        ri += 1
+    if ei < len(en_slice):
+        extra = en_slice[ei:]
+        out.extend(extra)
+        inserted.append(extra)
+    if ri < len(ru_slice):
+        extra = ru_slice[ri:]
+        start_pos = len(out)
+        out.extend(extra)
+        orphaned.append((start_pos, extra))
+
+
+def _align_replace_span(en_slice, ru_slice, en_sig_slice, ru_sig_slice, out, inserted, replaced, pairs, en_base, ru_base, force_synced, orphaned):
+    en_types = matching_signatures(en_sig_slice, "EN")
+    ru_types = matching_signatures(ru_sig_slice, "RU")
+    sm2 = difflib.SequenceMatcher(a=en_types, b=ru_types, autojunk=False)
+
+    for tag, i1, i2, j1, j2 in sm2.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                out.append(_sync_pair(
+                    en_slice[i1 + k], ru_slice[j1 + k], en_sig_slice[i1 + k][0], replaced,
+                    en_base + i1 + k, force_synced,
+                ))
+                pairs.append((en_base + i1 + k, ru_base + j1 + k))
+        elif tag == "delete":
+            new_lines = en_slice[i1:i2]
+            out.extend(new_lines)
+            inserted.append(new_lines)
+        elif tag == "insert":
+            extra = ru_slice[j1:j2]
+            start_pos = len(out)
+            out.extend(extra)
+            orphaned.append((start_pos, extra))
+        elif tag == "replace":
+            _front_pair_and_append(
+                en_slice[i1:i2], ru_slice[j1:j2], en_sig_slice[i1:i2], ru_sig_slice[j1:j2],
+                out, inserted, replaced, pairs, en_base + i1, ru_base + j1, force_synced, orphaned,
+            )
+
+
+def sync_merge(en_lines, ru_lines):
+    en_sigs = sync_signatures(en_lines)
+    ru_sigs = sync_signatures(ru_lines)
+    en_match = matching_signatures(en_sigs, "EN")
+    ru_match = matching_signatures(ru_sigs, "RU")
+    sm = difflib.SequenceMatcher(a=en_match, b=ru_match, autojunk=False)
+
+    out = []
+    inserted = []
+    replaced = []
+    pairs = []
+    force_synced = set()
+    orphaned = []
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.extend(ru_lines[j1:j2])
+            for k in range(i2 - i1):
+                pairs.append((i1 + k, j1 + k))
+        elif tag == "delete":
+            new_lines = en_lines[i1:i2]
+            out.extend(new_lines)
+            inserted.append(new_lines)
+        elif tag == "insert":
+            extra = ru_lines[j1:j2]
+            start_pos = len(out)
+            out.extend(extra)
+            orphaned.append((start_pos, extra))
+        elif tag == "replace":
+            _align_replace_span(
+                en_lines[i1:i2], ru_lines[j1:j2], en_sigs[i1:i2], ru_sigs[j1:j2],
+                out, inserted, replaced, pairs, i1, j1, force_synced, orphaned,
+            )
+
+    return out, inserted, replaced, pairs, force_synced, orphaned
+
+
+HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+
+
+def _last_commit_touching(path: Path):
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", str(path)],
+        capture_output=True, text=True,
+    )
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def _git_diff_hunks(ref: str, path: Path):
+    result = subprocess.run(
+        ["git", "diff", "--unified=0", ref, "--", str(path)],
+        capture_output=True, text=True,
+    )
+    hunks = []
+    current = None
+    for line in result.stdout.splitlines():
+        m = HUNK_RE.match(line)
+        if m:
+            if current:
+                hunks.append(current)
+            old_start, old_count, new_start, new_count = m.groups()
+            current = {
+                "old_count": int(old_count) if old_count is not None else 1,
+                "new_start": int(new_start),
+                "new_count": int(new_count) if new_count is not None else 1,
+                "minus": [], "plus": [],
+            }
+        elif current is not None and line.startswith("-") and not line.startswith("---"):
+            current["minus"].append(line[1:])
+        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+            current["plus"].append(line[1:])
+    if current:
+        hunks.append(current)
+    return hunks
+
+
+def find_reworded_lines(en_path: Path, ru_path: Path, en_lines, ru_lines, pairs, force_synced, since: str = None):
+    ref = since or _last_commit_touching(ru_path)
+    if not ref:
+        return None, []
+
+    ru_touched = set()
+    for h in _git_diff_hunks(ref, ru_path):
+        if h["new_count"] == 0:
+            continue
+        ru_touched.update(range(h["new_start"], h["new_start"] + h["new_count"]))
+
+    hunks = _git_diff_hunks(ref, en_path)
+    en_to_ru = dict(pairs)
+    findings = []
+    for h in hunks:
+        if h["old_count"] == 0 or h["new_count"] == 0:
+            continue
+        for k in range(h["new_count"]):
+            new_lineno = h["new_start"] + k
+            en_idx = new_lineno - 1
+            if en_idx in force_synced:
+                continue
+            ru_idx = en_to_ru.get(en_idx)
+            if ru_idx is None:
+                continue
+            if (ru_idx + 1) in ru_touched:
+                continue
+            old_en = h["minus"][k] if k < len(h["minus"]) else None
+            findings.append({
+                "lineno": new_lineno,
+                "old_en": old_en,
+                "new_en": en_lines[en_idx],
+                "ru_lineno": ru_idx + 1,
+                "ru": ru_lines[ru_idx],
+            })
+    return ref, findings
+
+
+def apply_stale_markers(ru_lines, reworded):
+    marked = list(ru_lines)
+    count = 0
+    for f in sorted(reworded, key=lambda f: f["ru_lineno"], reverse=True):
+        ru_idx = f["ru_lineno"] - 1
+        if marked[ru_idx] == f["new_en"]:
+            continue
+        old_ru = marked[ru_idx]
+        marked[ru_idx] = f["new_en"]
+        marked.insert(ru_idx + 1, f"// STALE VERSION: {old_ru}")
+        count += 1
+    return marked, count
+
+
+ORPHAN_MARKER_TEXT = (
+    "// POSSIBLY ORPHANED: no EN counterpart found nearby -- "
+    "review whether this was intentionally removed upstream"
+)
+
+
+def _visible_orphan_offsets(block, already_reported):
+    return [
+        o for o, l in enumerate(block)
+        if l.strip() and not STALE_MARK_RE.match(l.strip())
+        and not ORPHAN_MARK_RE.match(l.strip())
+        and not COMMENT_LINE_RE.match(l.strip()) and l not in already_reported
+    ]
+
+
+def apply_orphan_markers(ru_lines, orphaned, already_reported):
+    marked = list(ru_lines)
+    positions = set()
+    for start_pos, block in orphaned:
+        offsets = _visible_orphan_offsets(block, already_reported)
+        if offsets:
+            positions.add(start_pos + offsets[0])
+    count = 0
+    for pos in sorted(positions, reverse=True):
+        if pos > 0 and ORPHAN_MARK_RE.match(marked[pos - 1].strip()):
+            continue
+        marked.insert(pos, ORPHAN_MARKER_TEXT)
+        count += 1
+    return marked, count
+
+
+def ru_path_for(en_path: Path) -> Path:
+    s = str(en_path)
+    if EN_MARK not in s:
+        sys.exit(f"error: path does not look like an EN page (missing '{EN_MARK}'): {en_path}")
+    return Path(s.replace(EN_MARK, RU_MARK, 1))
+
+
+def run_sync(en_file: str, dry_run: bool, since: str = None):
+    en_path = Path(en_file)
+    if not en_path.is_file():
+        sys.exit(f"error: not a file: {en_path}")
+
+    ru_path = ru_path_for(en_path)
+    en_lines = (_read_text(en_path) or "").splitlines()
+    ru_existed = ru_path.is_file()
+
+    if ru_existed:
+        ru_lines = (_read_text(ru_path) or "").splitlines()
+    else:
+        print(f"NOTE: {ru_path} does not exist yet -- creating it as a full (untranslated) copy of EN.")
+        ru_lines = []
+
+    merged, inserted, replaced, pairs, force_synced, orphaned = sync_merge(en_lines, ru_lines)
+
+    ref, reworded, marked = None, [], 0
+    if ru_existed:
+        ref, reworded = find_reworded_lines(en_path, ru_path, en_lines, ru_lines, pairs, force_synced, since=since)
+        if reworded:
+            ru_lines_marked, marked = apply_stale_markers(ru_lines, reworded)
+            if marked:
+                merged, inserted, replaced, pairs, force_synced, orphaned = sync_merge(en_lines, ru_lines_marked)
+
+    already_reported = set()
+    for f in reworded:
+        already_reported.add(f["new_en"])
+        already_reported.add(f["ru"])
+        if f["old_en"] is not None:
+            already_reported.add(f["old_en"])
+    for old, new in replaced:
+        already_reported.add(old)
+        already_reported.add(new)
+    for block in inserted:
+        already_reported.update(block)
+
+    merged, orphan_marked = apply_orphan_markers(merged, orphaned, already_reported)
+
+    structurally_synced = merged == ru_lines
+
+    if structurally_synced:
+        print(f"OK: {ru_path} already matches the EN structure/content; nothing to do structurally.")
+    elif dry_run:
+        diff = difflib.unified_diff(
+            ru_lines, merged,
+            fromfile=str(ru_path), tofile=str(ru_path) + " (proposed)",
+            lineterm="",
+        )
+        print("\n".join(diff))
+    else:
+        ru_path.parent.mkdir(parents=True, exist_ok=True)
+        ru_path.write_text("\n".join(merged) + "\n", encoding="utf-8")
+        print(f"Updated {ru_path}")
+
+    real_inserted = []
+    for block in inserted:
+        visible = [l for l in block if not COMMENT_LINE_RE.match(l.strip())]
+        if any(l.strip() for l in visible):
+            real_inserted.append(visible)
+
+    if real_inserted:
+        total = sum(len(b) for b in real_inserted)
+        print(f"\nInserted {total} new line(s) from EN across {len(real_inserted)} block(s), left untranslated:")
+        for block in real_inserted:
+            for l in block:
+                print(f"  + {l}")
+            print()
+
+    if replaced:
+        print(f"Synced {len(replaced)} stale technical line(s) (flags/code/ids/paths) to match EN:")
+        for old, new in replaced:
+            print(f"  - {old}")
+            print(f"  + {new}")
+
+    if marked:
+        print(f"\nMarked {marked} reworded line(s) (EN wording changed since {ref[:10]} on lines the aligner")
+        print("otherwise left untouched): new EN sentence copied in, old RU preserved as a `// STALE VERSION:` comment:")
+        for f in reworded:
+            if f["ru"] == f["new_en"]:
+                continue
+            print(f"\n  EN:{f['lineno']} / RU:{f['ru_lineno']}")
+            print(f"    {f['new_en']}")
+            print(f"    // STALE VERSION: {f['ru']}")
+
+    if ru_existed and ref is None:
+        print(f"\nNOTE: no git history found for {ru_path}; skipped the reworded-line check.")
+
+    real_orphaned = []
+    for _, block in orphaned:
+        visible = [block[o] for o in _visible_orphan_offsets(block, already_reported)]
+        if visible:
+            real_orphaned.append(visible)
+    if real_orphaned:
+        total = sum(len(b) for b in real_orphaned)
+        print(f"\nPOSSIBLY ORPHANED: {total} RU line(s) across {len(real_orphaned)} block(s) have no EN counterpart")
+        print("anywhere nearby (left in place, not deleted -- review whether EN removed this on purpose).")
+        if orphan_marked:
+            print(f"Marked {orphan_marked} of them with a `// POSSIBLY ORPHANED:` comment right before the block, "
+                  "so it's visible directly in the file:")
+        for block in real_orphaned:
+            for l in block:
+                print(f"  ? {l}")
+            print()
+
+    if real_inserted or replaced or marked:
+        print("\nNext: run docs_tool.py --check-pages-translation to locate the newly untranslated lines for translation.")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    check_group = parser.add_argument_group("checks")
+    for name in CHECKS:
+        check_group.add_argument(f"--check-{name}", action="store_true", help=argparse.SUPPRESS)
+
+    parser.add_argument("--all-checks", action="store_true", help="Run every check.")
+    parser.add_argument("--list-checks", action="store_true", help="List available --check-* flags and exit.")
+    parser.add_argument("--list-modules", action="store_true",
+                         help="List every discovered module (under en/modules/ and ru/modules/) and exit.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                         help="Verbose mode: show diffs (parity checks) or enable the stricter "
+                              "stopword heuristic (--check-pages-translation).")
+
+    sync_group = parser.add_argument_group("sync")
+    sync_group.add_argument("--sync", metavar="EN_FILE",
+                             help="Align the RU counterpart of EN_FILE to match its current structure/content.")
+    sync_group.add_argument("-n", "--dry-run", action="store_true",
+                             help="With --sync: print the diff instead of writing the RU file.")
+    sync_group.add_argument("--since", metavar="REF",
+                             help="With --sync: git ref to diff the EN file against when looking for "
+                                  "reworded (not just added) lines (default: the last commit that touched the RU file).")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.list_checks:
+        for name in CHECKS:
+            print(f"--check-{name}")
+        return
+
+    if args.list_modules:
+        for name in discover_module_names():
+            print(name)
+        return
+
+    if args.sync:
+        run_sync(args.sync, dry_run=args.dry_run, since=args.since)
+        return
+
+    selected = list(CHECKS) if args.all_checks else [
+        name for name in CHECKS if getattr(args, f"check_{name.replace('-', '_')}")
+    ]
+
+    if not selected:
+        parser.print_help()
+        sys.exit(2)
+
+    overall_ok = True
+    for i, name in enumerate(selected):
+        if len(selected) > 1:
+            if i:
+                print()
+            print(f"=== --check-{name} ===")
+        if not CHECKS[name](verbose=args.verbose):
+            overall_ok = False
+
+    sys.exit(0 if overall_ok else 1)
+
+
+if __name__ == "__main__":
+    main()
