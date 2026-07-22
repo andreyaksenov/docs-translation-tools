@@ -21,6 +21,18 @@ Run it with an explicit path (`./docs_tool.py ...` or `python3 docs_tool.py ...`
 A bare `docs_tool.py` won't be found by your shell even after `chmod +x`, since the current directory isn't on `$PATH`.
 That's normal shell behavior, not a broken install.
 
+### Windows
+
+Windows doesn't have an executable bit, so skip the `chmod` step and run the file with `python` (or the `py` launcher) instead of `./docs_tool.py`:
+
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/andreyaksenov/docs-translation-tools/main/scripts/docs_tool.py -OutFile docs_tool.py
+python docs_tool.py --check-<name>
+```
+
+`curl` also ships with modern Windows 10/11, so the `curl -O ...` command above works as-is in PowerShell or cmd too.
+`--sync` shells out to `git` to detect reworded lines, so make sure Git for Windows (or any git on `PATH`) is installed.
+
 ## Usage
 
 ```bash
