@@ -87,7 +87,7 @@ Checks that each module's EN and RU `examples/` directories have the same files.
 ### Images
 
 **`--check-images-orphaned`**
-Checks (per language) that every file under `images/` has its filename referenced somewhere in `pages/` or `partials/` -- anywhere in that language across the whole site, not just its own module, since a page in one module can reference another module's image via a qualified `image::<module>:path[]` macro.
+Checks (per language) that every file under `images/` has its filename referenced somewhere in `pages/` or `partials/` -- anywhere in that language across the whole site, not just its own module, since a page in one module can reference another module's image via a qualified `image::<module>:path[]` macro. Ends with a total count and combined file size of the orphaned images found, as a rough gauge of cleanup impact.
 
 ### Nav
 

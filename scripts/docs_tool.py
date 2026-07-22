@@ -124,6 +124,15 @@ def _iter_files(root: Path, suffix: str = None):
             yield p
 
 
+def _format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB"):
+        if size < 1024:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GB"
+
+
 def _labeled_unified_diff(en_lines, ru_lines, en_label, ru_label, n=1):
     """Render a unified diff with each changed line prefixed by its source
     file label, matching the `sed -e "s|^-|- $en_file:  |" ...` treatment
@@ -299,6 +308,8 @@ def check_images_orphaned(verbose=False) -> bool:
     substring of that qualified target, so no path-aware matching is
     needed once the corpus covers the whole site)."""
     ok = True
+    orphaned_bytes = 0
+    orphaned_count = 0
     modules = list(module_roots())
     for lang_roots in (
             [en_root for _, en_root, _ in modules],
@@ -319,9 +330,13 @@ def check_images_orphaned(verbose=False) -> bool:
             for f in _iter_files(images_root):
                 if f.name not in corpus:
                     ok = False
+                    orphaned_count += 1
+                    orphaned_bytes += f.stat().st_size
                     print(f"ORPHANED  {f}  (not referenced in any pages/partials)")
     if ok:
         print("OK: all images are referenced somewhere.")
+    else:
+        print(f"\nTotal: {orphaned_count} orphaned image(s), {_format_size(orphaned_bytes)}")
     return ok
 
 
