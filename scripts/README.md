@@ -23,6 +23,11 @@ chmod +x docs_tool.py
 
 (Source: <https://github.com/andreyaksenov/docs-translation-tools/tree/main/scripts>.)
 
+Run it with an explicit path (`./docs_tool.py ...` or `python3 docs_tool.py ...`)
+from the repo root -- a bare `docs_tool.py` won't be found by your shell even
+after `chmod +x`, since the current directory isn't on `$PATH`. That's normal
+shell behavior, not a broken install.
+
 If it lost its executable bit (for example, after downloading or copying the
 folder), restore it with:
 
