@@ -987,7 +987,7 @@ _PRODUCT_NAMES_RE = re.compile(r'\b(?:CentOS|Ubuntu|Red Hat|RHEL)\b')
 
 _SKIP_ATTR_RE = re.compile(r'^\[.*\]$')
 _SKIP_CODESPAN_ITEM_RE = re.compile(r'^[*.\s]+`[^`]+`\s*$')
-_SKIP_BOLDITALIC_ITEM_RE = re.compile(r'^[*.\s]+\*_[^*_]+_\*\s*$')
+_SKIP_BOLDITALIC_ITEM_RE = re.compile(r'^[*.\s]+\*_[^*_]+_\*(:\s*\S+)?\s*$')
 _SKIP_TABLE_CELL_RE = re.compile(r'^(\.\d+\+)?[a-z]?\|')
 _SKIP_ALLCAPS_TITLE_RE = re.compile(r'^\.[^a-z]+$')
 _SKIP_FUNC_HEADING_RE = re.compile(r'^=+\s[A-Za-z_][A-Za-z0-9_]*\(.*\)')
