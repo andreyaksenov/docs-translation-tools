@@ -25,6 +25,10 @@ flag needed. Examples:
     ./docs_tool.py --all-checks -v
     ./docs_tool.py --sync en/modules/ROOT/pages/reference/utils/analyzedb.adoc -n
     ./docs_tool.py --sync en/modules/how-to/pages/manage-cluster/pam.adoc -n
+
+--sync and the checks --list-checks marks (beta) rely on heuristics rather
+than a real AsciiDoc parser and can misfire on legitimate content -- treat
+their output as a review list, not a hard gate.
 """
 import argparse
 import difflib
@@ -1263,6 +1267,14 @@ CHECKS = {
     "pages-translation": check_pages_translation,
 }
 
+# Checks whose logic is heuristic (no real AsciiDoc parser behind it) and can
+# therefore misfire on legitimate content -- flagged so --list-checks and the
+# README can warn people to treat their output as a review list, not a gate.
+BETA_CHECKS = {
+    "pages-structure-parity",
+    "pages-translation",
+}
+
 
 # ==========================================================================
 # SYNC: align a RU page's structure/content with its EN counterpart after an
@@ -1807,7 +1819,9 @@ def build_parser():
 
     sync_group = parser.add_argument_group("sync")
     sync_group.add_argument("--sync", metavar="EN_FILE",
-                            help="Align the RU counterpart of EN_FILE to match its current structure/content.")
+                            help="(beta) Align the RU counterpart of EN_FILE to match its current "
+                                 "structure/content. Heuristic aligner, not a semantic merge -- review its "
+                                 "output before trusting it.")
     sync_group.add_argument("-n", "--dry-run", action="store_true",
                             help="With --sync: print the diff instead of writing the RU file.")
     sync_group.add_argument("--since", metavar="REF",
@@ -1824,7 +1838,11 @@ def main():
 
     if args.list_checks:
         for name in CHECKS:
-            print(f"--check-{name}")
+            tag = " (beta)" if name in BETA_CHECKS else ""
+            print(f"--check-{name}{tag}")
+        if any(name in BETA_CHECKS for name in CHECKS):
+            print("\n(beta): heuristic, not a real AsciiDoc parser -- treat findings as a "
+                  "review list, not a hard failure.")
         return
 
     if args.list_modules:

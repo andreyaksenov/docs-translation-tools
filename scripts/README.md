@@ -57,11 +57,12 @@ pages-no-cyrillic
 pages-no-invisible-chars
 pages-no-unicode-dashes
 pages-orphaned
-pages-structure-parity
-pages-translation
+pages-structure-parity (beta)
+pages-translation (beta)
 ```
 
 (Or `python3 docs_tool.py ...`, per the note above.)
+`(beta)` checks are heuristic rather than a real AsciiDoc parser and can misfire on legitimate content — see their entries under [Checks](#checks) for details, and treat their output as a review list, not a hard gate.
 
 Multiple `--check-*` flags can be combined in one run.
 Exits `0` if every selected check passed, `1` if any check found something.
@@ -144,11 +145,11 @@ Run `./docs_tool.py --list-checks` to see the full list.
   Checks (per language) that every `pages/*.adoc` file is reachable from some module's `nav.adoc`, resolving the `include::partial$...[]` sections nav.adoc pulls in (e.g. SQL command / utility reference lists) and allowing cross-module nav links.
   The site's `start_page` (from `antora.yml`) is exempt, since it's not expected to be in the sidebar.
 
-- `--check-pages-structure-parity` (reports the first differing line by default; `-v` shows the full diff with file:line references)
+- `--check-pages-structure-parity` (beta; reports the first differing line by default; `-v` shows the full diff with file:line references)
 
   Deeper check for `pages/`/`partials/` `.adoc` files: compares the structural "skeleton" of each EN/RU pair (heading levels, block titles, delimited blocks, block attributes, `include::` directives) so structural drift is caught even when line counts match.
 
-- `--check-pages-translation` (`-v` also flags RU lines containing common English stopwords)
+- `--check-pages-translation` (beta; `-v` also flags RU lines containing common English stopwords)
 
   Checks `pages/` and `partials/` `.adoc` files for lines that look like they were never translated: walks EN and RU line-by-line and flags any prose line where RU is byte-identical to EN, skipping:
 
@@ -160,7 +161,9 @@ Run `./docs_tool.py --list-checks` to see the full list.
 This is a heuristic, not a full AsciiDoc parser.
 Treat findings as a review list, not a hard failure.
 
-## Sync a RU page after an EN edit
+## Sync a RU page after an EN edit (beta)
+
+Heuristic aligner, not a semantic merge — review its output before trusting it; see the caveat below.
 
 ```bash
 ./docs_tool.py --sync en/modules/ROOT/pages/reference/utils/analyzedb.adoc
