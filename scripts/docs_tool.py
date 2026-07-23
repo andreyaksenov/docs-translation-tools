@@ -31,6 +31,7 @@ import difflib
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 EN_MODULES_ROOT = Path("en/modules")
@@ -38,6 +39,27 @@ RU_MODULES_ROOT = Path("ru/modules")
 
 CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]')
 EN_EM_DASH_RE = re.compile(r'[–—]')
+
+# Zero-width/invisible-by-definition Unicode ranges: ZWSP/ZWNJ/ZWJ/bidi marks,
+# soft hyphen, the Mongolian vowel separator, bidi embedding/override/isolate
+# controls, word joiner and the invisible math operators, the BOM, and the
+# Unicode tag characters (U+E0000-U+E007F) -- a range with no visible glyph
+# at all, known to be abused to smuggle hidden ASCII text past a casual read
+# of the source (an "ASCII smuggling" trick), not just a typography quirk.
+_INVISIBLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x2069),
+    (0xFEFF, 0xFEFF),
+    (0xE0000, 0xE007F),
+)
+_INVISIBLE_RE = re.compile('[' + ''.join(
+    re.escape(chr(lo)) if lo == hi else f"{re.escape(chr(lo))}-{re.escape(chr(hi))}"
+    for lo, hi in _INVISIBLE_RANGES
+) + ']')
 
 # Populated from --external-root NAME=PATH (see main()). Lets
 # --check-pages-broken-refs resolve xref:/include:: targets that point at a
@@ -830,6 +852,58 @@ def check_pages_no_cyrillic(verbose=False) -> bool:
     return ok
 
 
+def _invisible_char_label(ch: str) -> str:
+    """Human-readable label for an invisible character: its Unicode name if
+    it has one, alongside the codepoint -- some tag characters format as
+    nothing printable of their own, so the codepoint is sometimes all
+    there is to go on."""
+    try:
+        name = unicodedata.name(ch)
+    except ValueError:
+        name = "UNKNOWN"
+    return f"U+{ord(ch):04X} {name}"
+
+
+def _mark_invisible_chars(line: str) -> str:
+    """Render a line with every invisible character swapped for a visible
+    marker -- printed verbatim, a hit would be indistinguishable from a
+    clean line, which would defeat the point of the check."""
+    return _INVISIBLE_RE.sub(lambda m: f"⟦U+{ord(m.group(0)):04X}⟧", line)
+
+
+def check_pages_no_invisible_chars(verbose=False) -> bool:
+    """New check (not a port of an existing shell script): flags zero-width
+    and other invisible/formatting Unicode characters -- ZWSP, ZWNJ, ZWJ,
+    word joiner, BOM, bidi control marks, and Unicode tag characters -- in
+    en/ru pages/partials (see _INVISIBLE_RANGES for the full list and why).
+    These render as nothing, so unlike the Cyrillic/dash checks, hits are
+    reported with the character swapped for a visible marker rather than
+    printed as-is."""
+    ok = True
+    total_hits = 0
+    for _, en_root, ru_root in module_roots():
+        for root in (en_root, ru_root):
+            for f in list(_iter_files(root / "pages", ".adoc")) + list(_iter_files(root / "partials", ".adoc")):
+                lines = _read_lines(f)
+                if lines is None:
+                    continue
+                hits = [(i, l) for i, l in enumerate(lines, 1) if _INVISIBLE_RE.search(l)]
+                if hits:
+                    ok = False
+                    total_hits += len(hits)
+                    print(f"FILE     {f}")
+                    for i, l in hits:
+                        labels = ", ".join(sorted({_invisible_char_label(ch) for ch in _INVISIBLE_RE.findall(l)}))
+                        print(f"  line {i}: {labels}")
+                        if verbose:
+                            print(f"    {_mark_invisible_chars(l)}")
+    if ok:
+        print("OK: no invisible/zero-width characters found in pages.")
+    else:
+        print(f"\nTotal: {total_hits} line(s) with invisible characters.")
+    return ok
+
+
 def check_pages_no_unicode_dashes(verbose=False) -> bool:
     """Port of check_pages_no_unicode_dashes.sh (en/ and ru/, all modules)."""
     ok = True
@@ -1182,6 +1256,7 @@ CHECKS = {
     "pages-broken-refs": check_pages_broken_refs,
     "pages-line-parity": check_pages_line_parity,
     "pages-no-cyrillic": check_pages_no_cyrillic,
+    "pages-no-invisible-chars": check_pages_no_invisible_chars,
     "pages-no-unicode-dashes": check_pages_no_unicode_dashes,
     "pages-orphaned": check_pages_orphaned,
     "pages-structure-parity": check_pages_structure_parity,

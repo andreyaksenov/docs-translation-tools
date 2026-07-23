@@ -54,6 +54,7 @@ nav-structure-parity
 pages-broken-refs
 pages-line-parity
 pages-no-cyrillic
+pages-no-invisible-chars
 pages-no-unicode-dashes
 pages-orphaned
 pages-structure-parity
@@ -128,6 +129,11 @@ Run `./docs_tool.py --list-checks` to see the full list.
 - `--check-pages-no-cyrillic`
 
   Checks that no `pages/`/`partials/` `.adoc` file under `en/modules/` contains Cyrillic characters — catches RU text accidentally left in (or pasted into) an EN file.
+
+- `--check-pages-no-invisible-chars` (`-v` also prints each hit line with the invisible character swapped for a visible `⟦U+XXXX⟧` marker)
+
+  Checks (per language) that no `pages/`/`partials/` `.adoc` file contains zero-width or other invisible/formatting Unicode characters — zero-width space/non-joiner/joiner, word joiner, BOM, bidi control marks, soft hyphen, and Unicode tag characters (`U+E0000`–`U+E007F`, a range with no visible glyph at all, known to be abused to smuggle hidden text past a casual read of the source).
+  These render as nothing, so a hit is invisible if the line is printed as-is; without `-v` only the character's name and codepoint are shown, run with `-v` to see exactly where in the line it sits.
 
 - `--check-pages-no-unicode-dashes`
 
